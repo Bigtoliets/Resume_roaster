@@ -65,7 +65,13 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.approvals import wait_for_approval
+from app.agent.checkpoints import (
+    PendingApproval,
+    TurnCheckpoint,
+    register_pending,
+    release_pending,
+    wait_for_decision,
+)
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM, render_variables
 from app.agent.tool_docs import render_tools_text
 from app.core.security import decrypt
@@ -394,6 +400,17 @@ class TurnResult:
     tool_call_ids: list[int]
 
 
+
+# 【上次回合落库的】messages 表：user(#121) + assistant(#122, 含 text+steps)
+#                                     ↓ build_history 只取 text
+# 【本次回合开跑】内存 messages：system + [history...] + 本轮 user
+#                                     ↓ 逐轮追加（不落库）
+#                                assistant(tool_calls) + tool(完整结果)
+#                                assistant(tool_calls) + tool(完整结果)
+#                                ...
+#                                assistant(最终文本)
+#                                     ↓ 回合结束
+# 【落库】messages 表：本轮 user + 本轮 assistant（text + steps，工具结果只留摘要）
 async def run_react_turn(
     db: AsyncSession,
     *,
@@ -406,6 +423,7 @@ async def run_react_turn(
     attachments: list[dict[str, Any]],
     emit: EmitFn,
     approval_timeout_s: float = 180,
+    checkpoint: TurnCheckpoint | None = None,
 ) -> TurnResult:
     """跑完一个完整的 ReAct 回合，返回最终回答与全部步骤。
 
@@ -462,6 +480,11 @@ async def run_react_turn(
     final_text = ""
     #: 本轮新增消息的起点（只影响 Langfuse 上报，见 client._report_generation）
     new_from = 0
+    # 本回合的"确认记忆"——生命周期就是**这一次对话回合**，下一轮用户消息进来就重置。
+    # 有 checkpoint 时直接复用它的集合（那样刷新页面也能续），没有就用局部变量。
+    # 确认过的工具不再问，取消过的工具直接拒（避免"取消→模型换参数再来→又弹卡片"的骚扰循环）。
+    approved_tools: set[str] = checkpoint.approved_tools if checkpoint is not None else set()
+    cancelled_tools: set[str] = checkpoint.cancelled_tools if checkpoint is not None else set()
 
     # ══════════════════════════════════════════════════════════════════
     # 主循环：每一轮 = 一次 LLM 调用 + 它要求的工具调用 + 结果回灌
@@ -644,38 +667,96 @@ async def run_react_turn(
                 await db.commit()
                 await db.refresh(record)
 
-                # 三种取结果的方式，按优先级排列：
+                # 取结果的优先级，顺序不能乱：
                 #   1. 并发预取已经跑完 → 直接取结果
                 if call.id in parallel_direct:
                     observation, status, elapsed_ms = parallel_direct[call.id]
                     record.elapsed_ms = elapsed_ms
-                #   2. 需要人工确认 → 推审批请求并挂起等待（超时按拒绝处理）
+                #   2. 本回合已被用户**取消**过 → 不再弹卡片，直接拒绝
+                elif tool.name in cancelled_tools:
+                    observation = {
+                        "ok": False,
+                        "summary": (
+                            f"用户已经取消过「{display}」，本轮不要再调用它；"
+                            "请换个方式，或者基于已有信息作答"
+                        ),
+                        "error": "cancelled_by_user",
+                    }
+                    status = "rejected"
+                #   3. 本回合已被用户**确认**过 → 跳过询问，直接执行
+                elif tool.name in approved_tools:
+                    started = time.perf_counter()
+                    observation = await execute_tool(
+                        db, tool=tool, arguments=call.arguments, fallback_llm=llm
+                    )
+                    status = "ok" if observation.get("ok", True) else "error"
+                    record.elapsed_ms = int((time.perf_counter() - started) * 1000)
+                #   4. 需要人工确认 → 弹卡片并挂起等待（可配超时，返回三态）
                 elif tool.requires_approval:
                     record.status = "pending_approval"
                     await db.commit()
-                    await emit(
-                        "approval_required",
-                        {
-                            "tool_call_id": record.id,
-                            "tool": tool.name,
-                            "tool_display": display,
-                            "arguments": call.arguments,
-                            "timeout_s": int(approval_timeout_s),
-                        },
+                    # 把这次等待登记进 checkpoint：刷新页面后前端据此重建卡片，
+                    # 审批接口也靠它反查到"是哪个回合在等"
+                    pending = PendingApproval(
+                        tool_call_id=record.id,
+                        tool_name=tool.name,
+                        tool_display=display,
+                        tool_hint=(tool.description or "")[:120],
+                        arguments=call.arguments,
+                        created_at=time.monotonic(),
+                        timeout_s=int(approval_timeout_s),
                     )
-                    approved = await wait_for_approval(record.id, approval_timeout_s)
-                    record.approved = approved
+                    # 无条件登记：没有 checkpoint 时也要让审批接口能按 id 找到它
+                    register_pending(checkpoint, pending)
+                    await emit("approval_required", pending.dump())
+                    # 挂起：等用户点确认/取消，或超时
+                    decision = await wait_for_decision(pending)
+                    release_pending(pending)
+                    # 记忆规则（都只作用于**本回合**，下一条用户消息进来就重置）：
+                    #   - 用户取消 → 无条件记住：本回合不再问这个工具，模型再调就直接拒
+                    #     （否则会变成"取消 → 模型换参数再来 → 又弹卡片"的骚扰循环）
+                    #   - 用户确认 → 只有勾了"本回合不再问我"才记住
+                    if decision == "cancelled":
+                        cancelled_tools.add(tool.name)
+                    elif decision == "approved" and pending.remember:
+                        approved_tools.add(tool.name)
+                    # 把这张确认卡片**也写进步骤流**：回合结束后它随消息一起落库，
+                    # 用户回看时能看到"哪些工具被确认过、哪些被取消过"。
+                    # 顺序上它排在"行动"之后、"观察"之前，正好是决策发生的位置。
+                    approval_step = Step(
+                        type="approval",
+                        tool=tool.name,
+                        tool_display=display,
+                        # 带上主键：前端据此把"等待中"的临时卡片替换成"已决"卡片，
+                        # 而不是并排出现两张
+                        tool_call_id=record.id,
+                        arguments=call.arguments,
+                        status=decision,
+                        summary={
+                            "approved": "已确认执行",
+                            "cancelled": "已取消（本回合不再询问）",
+                            "timeout": "等待超时，已跳过",
+                        }.get(decision, decision),
+                    )
+                    steps.append(approval_step)
+                    await emit("step", approval_step.dump())
+                    record.approved = decision == "approved"
                     await db.commit()
-                    if not approved:
-                        # 拒绝时同样回灌一条观察结果，措辞是写给**模型**看的：
-                        # 引导它换个办法，而不是让整轮就此卡住
+                    if decision != "approved":
+                        # 取消与超时给**不同**的措辞：超时是"没等到人"，
+                        # 取消是"人明确不让做"——模型该做的反应不一样
                         observation = {
                             "ok": False,
-                            "summary": "用户拒绝执行该工具，请换个方式或直接说明无法完成",
+                            "summary": (
+                                "用户取消了执行，请换个方式或直接说明无法完成"
+                                if decision == "cancelled"
+                                else "等待用户确认超时，请换个不需要确认的做法继续"
+                            ),
+                            "error": decision,
                         }
-                        status = "rejected"
+                        status = "rejected" if decision == "cancelled" else "timeout"
                     else:
-                        # 批准后正常执行（串行，用主会话）
+                        # 确认后正常执行（串行，用主会话）
                         started = time.perf_counter()
                         observation = await execute_tool(
                             db, tool=tool, arguments=call.arguments, fallback_llm=llm
@@ -733,6 +814,15 @@ async def run_react_turn(
         # 下一轮模型看到的"新增"就是本轮追加的 assistant + observation，
         # 而它们的起点恰恰是 round_baseline（只影响 Langfuse 上报）。
         new_from = round_baseline
+
+        # 同步作业面到 checkpoint：刷新页面后前端靠 steps 重建时间线；
+        # 若后面挂起等待确认，唤醒后后台任务也靠 messages 接着往下跑。
+        # 注意 messages 是**引用赋值**（同一个 list），后续追加会自动反映，不必每步都同步。
+        if checkpoint is not None:
+            checkpoint.round_index = round_index
+            checkpoint.messages = messages
+            checkpoint.steps = [step.dump() for step in steps]
+            checkpoint.tool_call_ids = list(tool_call_ids)
     else:
         # for...else：只有循环**自然跑完**（没有 break）才执行，即 max_rounds 轮都没得出结论。
         # 给一句明确交代，而不是返回空让用户以为出错了。
@@ -743,6 +833,12 @@ async def run_react_turn(
     if not final_text:
         final_text = "（模型没有给出最终回答）"
         await emit("token", {"round": 0, "delta": final_text})
+
+    # 回合结束：把终态写进 checkpoint（前端可能还在重连，需要知道"已经完了"）
+    if checkpoint is not None:
+        checkpoint.status = "finished"
+        checkpoint.final_text = final_text
+        checkpoint.steps = [step.dump() for step in steps]
 
     # 回传给调用方（sessions_router）：
     #   text           最终回答，落进 assistant 消息的 content.text

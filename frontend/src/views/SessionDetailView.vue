@@ -12,7 +12,7 @@ import { confirmDialog } from '@/composables/useDialog'
 import { describeError } from '@/composables/useResource'
 
 interface Step {
-  type: 'thought' | 'action' | 'observation'
+  type: 'thought' | 'action' | 'observation' | 'approval'
   text?: string
   tool?: string
   tool_display?: string
@@ -20,6 +20,10 @@ interface Step {
   tool_call_id?: number | null
   summary?: string
   status?: string
+  // ---- 仅 approval 用 ----
+  tool_hint?: string
+  remaining_s?: number
+  timeout_s?: number
 }
 
 const props = defineProps<{ id?: string }>()
@@ -56,6 +60,12 @@ function startTimer() {
   if (timer !== null) window.clearInterval(timer)
   timer = window.setInterval(() => {
     elapsed.value += 1
+    // 待确认卡片的倒计时：每秒把 pending 的那几张减一
+    for (const step of liveSteps.value) {
+      if (step.type === 'approval' && step.status === 'pending' && (step.remaining_s ?? 0) > 0) {
+        step.remaining_s = (step.remaining_s ?? 0) - 1
+      }
+    }
   }, 1000)
 }
 
@@ -292,7 +302,22 @@ async function send() {
         if (event === 'stage') {
           liveStage.value = String(data.agent ? `${data.agent} 正在思考` : '正在思考')
         } else if (event === 'step') {
-          liveSteps.value = [...liveSteps.value, data as unknown as Step]
+          const incoming = data as unknown as Step
+          // 确认卡片有两次推送：先是 approval_required（等待中，临时渲染），
+          // 决策完成后后端再推一条同 tool_call_id 的"已决"卡片——这里做替换，避免并排两张。
+          const index =
+            incoming.type === 'approval' && incoming.tool_call_id
+              ? liveSteps.value.findIndex(
+                  (item) => item.type === 'approval' && item.tool_call_id === incoming.tool_call_id,
+                )
+              : -1
+          if (index >= 0) {
+            liveSteps.value = liveSteps.value.map((item, i) =>
+              i === index ? { ...item, ...incoming } : item,
+            )
+          } else {
+            liveSteps.value = [...liveSteps.value, incoming]
+          }
           await scrollToBottom(true)
         } else if (event === 'token') {
           liveTokens.value += String(data.delta || '')
@@ -301,20 +326,25 @@ async function send() {
           liveTokens.value = String(data.content || liveTokens.value)
           liveSteps.value = (data.steps as unknown as Step[]) || liveSteps.value
         } else if (event === 'approval_required') {
-          const toolCallId = Number(data.tool_call_id)
-          const approved = await confirmDialog({
-            title: `允许执行「${data.tool_display || data.tool}」？`,
-            description:
-              `模型请求调用这个工具，参数：\n${JSON.stringify(data.arguments, null, 2).slice(0, 600)}\n\n` +
-              `不批准的话，它会收到「用户拒绝执行」并继续。`,
-            confirmText: '批准执行',
-            cancelText: '拒绝',
-          })
-          await fetch(`/api/v1/tool-calls/${toolCallId}/approve`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ approved }),
-          })
+          // 不再弹浮层：把确认卡片**插进步骤流**，嵌在这一轮的思考/行动之间
+          liveSteps.value = [
+            ...liveSteps.value,
+            {
+              type: 'approval',
+              tool: String(data.tool || ''),
+              tool_display: String(data.tool_display || data.tool || ''),
+              tool_hint: String(data.tool_hint || ''),
+              arguments: (data.arguments as Record<string, unknown>) || {},
+              tool_call_id: Number(data.tool_call_id),
+              remaining_s: Number(data.remaining_s ?? data.timeout_s ?? 300),
+              timeout_s: Number(data.timeout_s ?? 300),
+              status: 'pending',
+              text: '',
+              call_id: '',
+              summary: '',
+            } as Step,
+          ]
+          await scrollToBottom(true)
         } else if (event === 'error') {
           error.value = `${data.code ?? 'ERROR'}：${data.msg ?? ''}`
         }
@@ -334,6 +364,29 @@ async function send() {
     await Promise.all([loadSessions(), loadMessages()])
     await scrollToBottom()
   }
+}
+
+/**
+ * 确认卡片上的「确认 / 取消」：调后端唤醒回合，并把卡片切成已完成状态。
+ *
+ * `remember` 只对"确认"有意义（勾了才记住）；取消一律按"本回合不再问"处理，
+ * 由后端负责，前端不额外传。
+ */
+async function decideApproval(step: Step, approved: boolean, remember: boolean) {
+  if (!step.tool_call_id) return
+  step.status = 'sending'
+  try {
+    await fetch(`/api/v1/tool-calls/${step.tool_call_id}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ approved, remember }),
+    })
+    step.status = approved ? 'approved' : 'cancelled'
+  } catch (exc) {
+    step.status = 'error'
+    error.value = describeError(exc)
+  }
+  await scrollToBottom(true)
 }
 
 async function upload(event: Event) {
@@ -540,7 +593,12 @@ onMounted(async () => {
             <div class="row" style="gap: 8px; margin-bottom: 6px">
               <span class="eyebrow">{{ liveStage }} · 已用 {{ elapsed }}s</span>
             </div>
-            <StepsTimeline :steps="liveSteps" :default-open="true" streaming />
+            <StepsTimeline
+              :steps="liveSteps"
+              :default-open="true"
+              streaming
+              @decide="decideApproval"
+            />
             <!-- 中间态不展示：流式 token 只在结束后作为最终回答出现 -->
             <div v-if="!liveSteps.length" class="bubble bubble--ai bubble--thinking">
               <span class="dot" /><span class="dot" style="animation-delay: 0.15s" /><span

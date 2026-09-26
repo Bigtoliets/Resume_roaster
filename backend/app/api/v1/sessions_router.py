@@ -23,7 +23,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.approvals import resolve_approval
+from app.agent.checkpoints import get as get_checkpoint
+from app.agent.checkpoints import resolve_pending
+from app.agent.checkpoints import snapshot as checkpoint_snapshot
 from app.agent.loop import run_react_turn
 from app.api.deps import get_db
 from app.core.cache import (
@@ -231,9 +233,40 @@ async def get_tool_call(tool_call_id: int, db: AsyncSession = Depends(get_db)) -
 
 @router.post("/tool-calls/{tool_call_id}/approve")
 async def approve_tool_call(tool_call_id: int, payload: ApprovalIn) -> dict[str, Any]:
-    """唤醒等待确认的 ReAct 循环；没有等待中的调用时 waiting=false。"""
-    waiting = resolve_approval(tool_call_id, payload.approved)
-    return {"tool_call_id": tool_call_id, "approved": payload.approved, "waiting": waiting}
+    """唤醒等待确认的 ReAct 回合。
+
+    两种决定：
+      - `approved=true`  → 执行（`remember=true` 则本回合同工具不再问）
+      - `approved=false` → 取消（`remember=true` 则本回合同工具直接拒，不再弹卡片）
+
+    没有等待中的调用时 `waiting=false`（说明已超时或已处理过）。
+    """
+    decision = "approved" if payload.approved else "cancelled"
+    waiting = resolve_pending(tool_call_id, decision, remember=payload.remember)
+    return {
+        "tool_call_id": tool_call_id,
+        "decision": decision,
+        "remember": payload.remember,
+        "waiting": waiting,
+    }
+
+
+@router.get("/runs/{run_id}/checkpoint")
+async def get_run_checkpoint(run_id: int) -> dict[str, Any]:
+    """取一个正在跑的回合的进程内状态：刷新页面后前端据此重建时间线与待确认卡片。
+
+    回合不在内存里（已结束、或后端重启过）返回 404，前端退回"从 messages 表读历史"。
+    """
+    checkpoint = get_checkpoint(run_id)
+    if checkpoint is None:
+        raise HTTPException(status_code=404, detail="该回合不在内存中（可能已结束或后端重启过）")
+    return checkpoint.dump()
+
+
+@router.get("/checkpoints/stats")
+async def checkpoint_stats() -> dict[str, Any]:
+    """诊断用：当前有几个回合在跑、几个在等确认。"""
+    return checkpoint_snapshot()
 
 
 @router.get("/cache/stats")

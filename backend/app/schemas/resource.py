@@ -235,3 +235,5 @@ class ToolCallOut(ORMBase):
 
 class ApprovalIn(BaseModel):
     approved: bool
+    #: 是否"本回合不再问我"。前端勾了复选框就传 true。
+    remember: bool = False
