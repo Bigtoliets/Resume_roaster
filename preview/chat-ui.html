@@ -1,0 +1,1063 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>简历诊断助手 · 会话</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              paper: '#F8F6F1',
+              'paper-2': '#F1EEE7',
+              'paper-3': '#E9E5DB',
+              ink: '#1A1815',
+              'ink-2': '#55504A',
+              'ink-3': '#8C857A',
+              rule: '#E3DED3',
+              seal: '#B5341F',
+              'seal-ink': '#8D2415',
+            },
+            fontFamily: {
+              serif: ['"Noto Serif SC"', '"Songti SC"', 'Georgia', 'serif'],
+              mono: ['"JetBrains Mono"', '"Cascadia Mono"', 'Consolas', 'monospace'],
+            },
+            boxShadow: {
+              paper: '0 1px 0 rgba(26,24,21,.06), 0 18px 40px -28px rgba(26,24,21,.45)',
+              bubble: '0 1px 2px rgba(26,24,21,.04), 0 10px 24px -18px rgba(26,24,21,.35)',
+            },
+          },
+        },
+      }
+    </script>
+    <style>
+      :root {
+        --seal: #b5341f;
+        --seal-soft: rgba(181, 52, 31, 0.08);
+        --uifont: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB', sans-serif;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        font-family: var(--uifont);
+        -webkit-font-smoothing: antialiased;
+        color: #1a1815;
+      }
+      /* 纸张纤维：极淡的竖纹 + 两处柔光，避免纯色发闷 */
+      .grain::before {
+        content: '';
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        opacity: 0.55;
+        background-image:
+          repeating-linear-gradient(90deg, rgba(26, 24, 21, 0.018) 0 1px, transparent 1px 3px),
+          radial-gradient(circle at 18% 8%, rgba(181, 52, 31, 0.05), transparent 42%),
+          radial-gradient(circle at 88% 84%, rgba(61, 107, 74, 0.05), transparent 38%);
+      }
+      /* 滚动条：细、纸色 */
+      .thin::-webkit-scrollbar {
+        width: 8px;
+      }
+      .thin::-webkit-scrollbar-thumb {
+        background: #ddd7ca;
+        border-radius: 99px;
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      .thin::-webkit-scrollbar-thumb:hover {
+        background: #c9c2b2;
+        background-clip: content-box;
+      }
+      .thin::-webkit-scrollbar-track {
+        background: transparent;
+      }
+
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .rise {
+        animation: rise 0.4s cubic-bezier(0.22, 0.68, 0.34, 1) both;
+      }
+      @keyframes dot {
+        0%,
+        60%,
+        100% {
+          transform: translateY(0);
+          opacity: 0.35;
+        }
+        30% {
+          transform: translateY(-4px);
+          opacity: 1;
+        }
+      }
+      .dot {
+        animation: dot 1.2s infinite;
+      }
+      @keyframes pop {
+        0% {
+          opacity: 0;
+          transform: scale(0.9);
+        }
+        100% {
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+      .pop {
+        animation: pop 0.22s ease-out both;
+      }
+      @keyframes blink {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.15;
+        }
+      }
+      .caret {
+        animation: blink 1s steps(1) infinite;
+      }
+
+      /* 助手回复里的轻量 markdown 样式 */
+      .md h3 {
+        font-family: 'Noto Serif SC', 'Songti SC', Georgia, serif;
+        font-size: 15px;
+        font-weight: 600;
+        margin: 14px 0 6px;
+      }
+      .md p {
+        margin: 8px 0;
+        line-height: 1.85;
+      }
+      .md ul {
+        margin: 8px 0 8px 2px;
+        padding-left: 18px;
+        list-style: none;
+      }
+      .md li {
+        position: relative;
+        margin: 6px 0;
+        line-height: 1.8;
+      }
+      .md li::before {
+        content: '·';
+        position: absolute;
+        left: -12px;
+        color: #b5341f;
+        font-weight: 700;
+      }
+      .md strong {
+        font-weight: 600;
+        background: linear-gradient(180deg, transparent 62%, rgba(240, 224, 164, 0.9) 62%);
+      }
+      .md code {
+        font-family: 'JetBrains Mono', Consolas, monospace;
+        font-size: 12px;
+        background: #f3f0e8;
+        border: 1px solid #e3ded3;
+        border-radius: 4px;
+        padding: 1px 5px;
+      }
+      .md blockquote {
+        margin: 10px 0;
+        border-left: 2px solid #b5341f;
+        background: linear-gradient(90deg, var(--seal-soft), transparent 70%);
+        padding: 8px 12px;
+        font-family: 'Noto Serif SC', 'Songti SC', Georgia, serif;
+        color: #55504a;
+      }
+      .md table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 10px 0;
+        font-size: 13px;
+      }
+      .md th {
+        text-align: left;
+        font-family: 'JetBrains Mono', Consolas, monospace;
+        font-size: 10px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: #8c857a;
+        padding: 6px 8px;
+        border-bottom: 1px solid #d9d3c6;
+      }
+      .md td {
+        padding: 8px;
+        border-bottom: 1px solid #ece7dc;
+        vertical-align: top;
+      }
+      .typing::after {
+        content: '▌';
+        color: #b5341f;
+        margin-left: 2px;
+      }
+    </style>
+  </head>
+
+  <body class="grain bg-paper">
+    <div class="relative z-10 flex h-full">
+      <!-- ======================= 左侧：历史会话 ======================= -->
+      <aside
+        id="sidebar"
+        class="flex w-[292px] shrink-0 flex-col border-r border-rule bg-paper-2/80 backdrop-blur transition-all duration-200 max-[900px]:fixed max-[900px]:inset-y-0 max-[900px]:left-0 max-[900px]:z-40 max-[900px]:shadow-paper"
+      >
+        <!-- 品牌 -->
+        <div class="flex items-center gap-3 px-5 pb-4 pt-5">
+          <div
+            class="grid h-9 w-9 shrink-0 place-items-center rounded-[10px] border-2 border-seal bg-white/60 font-serif text-[15px] text-seal-ink"
+          >
+            诊
+          </div>
+          <div class="min-w-0">
+            <div class="truncate font-serif text-[15px] leading-tight">简历诊断助手</div>
+            <div class="font-mono text-[9px] uppercase tracking-[0.22em] text-ink-3">
+              Resume Roaster
+            </div>
+          </div>
+          <button
+            class="ml-auto rounded-lg p-1.5 text-ink-3 hover:bg-paper-3 hover:text-ink min-[901px]:hidden"
+            onclick="toggleSidebar(false)"
+            aria-label="收起侧栏"
+          >
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- 新建对话 -->
+        <div class="px-4">
+          <button
+            onclick="createSession()"
+            class="group flex w-full items-center gap-2 rounded-xl border border-ink bg-ink px-3.5 py-2.5 text-[13px] text-paper transition hover:-translate-y-px hover:shadow-paper"
+          >
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            新建对话
+            <span class="ml-auto font-mono text-[10px] text-paper/50 transition group-hover:text-paper/80">
+              ⌘N
+            </span>
+          </button>
+        </div>
+
+        <!-- 搜索 -->
+        <div class="px-4 pt-3">
+          <div class="flex items-center gap-2 rounded-xl border border-rule bg-white/70 px-3 py-2">
+            <svg class="h-3.5 w-3.5 text-ink-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="7" />
+              <path d="M20 20l-3.5-3.5" />
+            </svg>
+            <input
+              id="search"
+              oninput="renderSessions()"
+              placeholder="搜索历史会话"
+              class="w-full bg-transparent text-[12.5px] outline-none placeholder:text-ink-3"
+            />
+          </div>
+        </div>
+
+        <!-- 会话列表 -->
+        <nav id="sessionList" class="thin mt-3 flex-1 overflow-y-auto px-2.5 pb-4"></nav>
+
+        <!-- 侧栏底部 -->
+        <div class="border-t border-rule px-4 py-3">
+          <div class="flex items-center gap-2">
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-600/80"></span>
+            <span class="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
+              DeepSeek · 已连接
+            </span>
+            <span id="sessionCount" class="ml-auto font-mono text-[10px] text-ink-3"></span>
+          </div>
+        </div>
+      </aside>
+
+    <div id="backdrop" class="fixed inset-0 z-30 hidden bg-ink/20 backdrop-blur-sm min-[901px]:hidden" onclick="toggleSidebar(false)"></div>
+
+    <!-- 主题化对话框（替代原生 confirm / prompt） -->
+    <div
+      id="dialogMask"
+      class="fixed inset-0 z-[60] hidden place-items-center bg-ink/40 backdrop-blur-sm"
+      style="display: none"
+    >
+      <div
+        id="dialogCard"
+        class="dialog-card w-[min(430px,calc(100vw-40px))] rounded border border-[#c9c2b2] bg-paper p-5 shadow-paper"
+        role="dialog"
+        aria-modal="true"
+      >
+        <div class="flex items-start gap-3">
+          <span
+            id="dialogSeal"
+            class="grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[10px] border-2 border-seal bg-seal/5 font-serif text-[15px] text-seal-ink"
+            style="transform: rotate(-6deg)"
+          >
+            慎
+          </span>
+          <div class="min-w-0">
+            <div id="dialogEyebrow" class="font-mono text-[10px] uppercase tracking-[0.2em] text-ink-3">
+              不可撤销的操作
+            </div>
+            <h3 id="dialogTitle" class="mt-1 font-serif text-[17px] leading-snug"></h3>
+          </div>
+        </div>
+        <p id="dialogDesc" class="mt-3 text-[13px] leading-relaxed text-ink-2"></p>
+        <div id="dialogField" class="mt-3 hidden">
+          <label class="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">会话名称</label>
+          <input
+            id="dialogInput"
+            class="mt-1.5 w-full rounded-lg border border-[#c9c2b2] bg-white px-3 py-2 text-[13px] outline-none focus:border-ink/40"
+          />
+          <div id="dialogHint" class="mt-1 text-[11px] text-ink-3"></div>
+        </div>
+        <div class="mt-5 flex justify-end gap-2 border-t border-rule pt-3">
+          <button class="rounded-lg border border-[#c9c2b2] px-3 py-1.5 text-[12.5px] text-ink-2 hover:border-ink" onclick="resolveDialog(false)">
+            取消
+          </button>
+          <button id="dialogOk" class="rounded-lg border border-seal-ink bg-seal px-3 py-1.5 text-[12.5px] text-paper" onclick="submitDialog()">
+            删除
+          </button>
+        </div>
+      </div>
+    </div>
+
+      <!-- ======================= 右侧：对话 ======================= -->
+      <main class="relative flex min-w-0 flex-1 flex-col">
+        <!-- 顶栏 -->
+        <header class="flex items-center gap-3 border-b border-rule bg-paper/80 px-5 py-3 backdrop-blur">
+          <button
+            class="rounded-lg p-1.5 text-ink-2 hover:bg-paper-3 min-[901px]:hidden"
+            onclick="toggleSidebar(true)"
+            aria-label="展开侧栏"
+          >
+            <svg class="h-4.5 w-4.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+              <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <div class="min-w-0">
+            <div id="chatTitle" class="truncate font-serif text-[16px] leading-tight"></div>
+            <div class="mt-0.5 flex items-center gap-2">
+              <span
+                id="routeBadge"
+                class="hidden shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-seal bg-seal/5 px-2 py-[2px] font-mono text-[10px] tracking-wide text-seal-ink"
+              ></span>
+              <span id="chatMeta" class="hidden truncate font-mono text-[10px] text-ink-3 sm:inline"></span>
+            </div>
+          </div>
+          <div class="ml-auto flex items-center gap-1.5">
+            <button class="rounded-lg p-2 text-ink-3 transition hover:bg-paper-3 hover:text-ink" title="导出报告（示意）">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <path d="M12 3v12m0 0l-4-4m4 4l4-4M4 19h16" />
+              </svg>
+            </button>
+            <button class="rounded-lg p-2 text-ink-3 transition hover:bg-paper-3 hover:text-ink" title="清空当前会话" onclick="clearCurrent()">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
+              </svg>
+            </button>
+            <button class="rounded-lg p-2 text-ink-3 transition hover:bg-paper-3 hover:text-ink" title="重命名会话" onclick="renameCurrent()">
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <path d="M4 20h4l10-10-4-4L4 16v4zM14 6l4 4" />
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <!-- 消息区 -->
+        <div id="messages" class="thin flex-1 overflow-y-auto px-5 py-6 md:px-10"></div>
+
+        <!-- 输入区 -->
+        <div class="border-t border-rule bg-paper/85 px-5 py-4 backdrop-blur md:px-10">
+          <div class="mx-auto max-w-3xl">
+            <div class="rounded-2xl border border-rule bg-white shadow-paper transition focus-within:border-ink/40">
+              <!-- 主输入 -->
+              <textarea
+                id="input"
+                rows="1"
+                placeholder="说点什么…… 例如「帮我诊断这份简历，目标大数据开发实习生」"
+                class="thin max-h-40 w-full resize-none bg-transparent px-4 pt-3.5 text-[14px] leading-6 outline-none placeholder:text-ink-3"
+              ></textarea>
+
+              <!-- 工具栏 -->
+              <div class="flex flex-wrap items-center gap-2 px-3 pb-3 pt-1">
+                <label
+                  class="flex cursor-pointer items-center gap-1.5 rounded-lg border border-rule px-2.5 py-1.5 text-[12px] text-ink-2 transition hover:border-ink/40 hover:text-ink"
+                >
+                  <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                    <path d="M12 5v14M5 12h14" />
+                  </svg>
+                  简历附件
+                  <input type="file" class="hidden" onchange="mockUpload(this)" />
+                </label>
+                <select
+                  id="mode"
+                  class="rounded-lg border border-rule bg-white px-2 py-1.5 text-[12px] text-ink-2 outline-none transition hover:border-ink/40"
+                >
+                  <option value="auto">自动路由</option>
+                  <option value="resume_diagnosis">强制简历诊断</option>
+                  <option value="chat">强制通用对话</option>
+                </select>
+                <input
+                  id="targetRole"
+                  placeholder="目标岗位（可选）"
+                  class="w-[150px] rounded-lg border border-rule bg-white px-2 py-1.5 text-[12px] outline-none transition placeholder:text-ink-3 hover:border-ink/40 focus:border-ink/40"
+                />
+                <span id="attachChip" class="hidden items-center gap-1 rounded-lg bg-seal/5 px-2 py-1.5 font-mono text-[11px] text-seal-ink"></span>
+                <span class="spacer ml-auto hidden text-[11px] text-ink-3 md:block">
+                  Enter 发送 · Shift+Enter 换行
+                </span>
+                <button
+                  id="sendBtn"
+                  onclick="send()"
+                  class="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-seal-ink bg-seal text-paper transition hover:-translate-y-px disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                    <path d="M5 12h13M12 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <p class="mt-2 text-center text-[11px] text-ink-3">
+              内容由 AI 生成，诊断结论会锚定简历原句与真实 JD，请自行核对
+            </p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <script>
+      /* =====================================================================
+         模拟数据：4 个历史会话，覆盖「诊断链路」与「对话链路」两种形态
+         ===================================================================== */
+      const REPORT_CARD = `
+        <div class="mt-3 rounded-xl border border-rule bg-paper-2/60 p-4">
+          <div class="flex items-center gap-2">
+            <span class="rounded-md border-2 border-seal px-2 py-[3px] font-serif text-[12px] tracking-wide text-seal-ink rotate-[-6deg]">难以通过</span>
+            <span class="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">诊断报告 · 纯文本</span>
+            <span class="ml-auto font-mono text-[10px] text-ink-3">107.1s · 4 轮</span>
+          </div>
+          <h3 class="mt-3 font-serif text-[15px]">方向匹配，但硬性门槛未闭合，且全篇零量化</h3>
+          <table class="mt-2">
+            <thead><tr><th>致命弱点</th><th class="w-[64px] whitespace-nowrap text-right">严重度</th></tr></thead>
+            <tbody>
+              <tr><td class="whitespace-nowrap">城市仅填「杭」、可实习时长未披露</td><td class="text-right"><span class="font-mono text-seal">▮▮▮▮▮</span></td></tr>
+              <tr><td class="whitespace-nowrap">Redis 缓存无穿透/雪崩/击穿处理</td><td class="text-right"><span class="font-mono text-seal">▮▮▮▮<span class="opacity-20">▮</span></span></td></tr>
+              <tr><td class="whitespace-nowrap">Flink 只在技能栏出现，零场景证据</td><td class="text-right"><span class="font-mono text-seal">▮▮▮▮<span class="opacity-20">▮</span></span></td></tr>
+            </tbody>
+          </table>
+          <blockquote class="mt-3">
+            简历原句：使用 Redis 缓存热点商品数据，优化了查询性能；<br />
+            JD 依据（bigdata_jd_001）：熟悉 Redis 常见数据结构与缓存穿透/雪崩/击穿的应对方案
+          </blockquote>
+          <div class="mt-3 flex gap-2">
+            <button class="rounded-lg border border-ink bg-ink px-3 py-1.5 text-[12px] text-paper">复制全文</button>
+            <button class="rounded-lg border border-rule px-3 py-1.5 text-[12px] text-ink-2">下载 .txt</button>
+            <button class="rounded-lg border border-rule px-3 py-1.5 text-[12px] text-ink-2">本次装配</button>
+          </div>
+        </div>`
+
+      let sessions = [
+        {
+          id: 's1',
+          title: '简历诊断 · 大数据开发实习生',
+          group: '今天',
+          time: '14:32',
+          route: '简历诊断 · 置信度 95%',
+          meta: 'JD 8 篇 / 面经 5 篇 · 4 轮收敛',
+          messages: [
+            {
+              role: 'user',
+              text: '帮我看看这份简历，目标是大数据开发实习生',
+              attach: '张小明_简历.pdf · 8KB',
+              time: '14:28',
+            },
+            {
+              role: 'ai',
+              speaker: '技术面试官',
+              time: '14:30',
+              html: `<p>先说结论：<strong>方向匹配，但你过不了初筛</strong>——不是技术不行，是三条硬伤在 HR 那一关就会被刷。</p>
+                <ul>
+                  <li>目标岗位要求「可实习 6 个月以上」，你只写了 3 个月的实习经历，<strong>没写可实习起止时间</strong>；</li>
+                  <li>城市只填了「杭」，JD 明确工作地是杭州，但没说接不接受异地；</li>
+                  <li>Flink 只出现在技能栏，项目和实习里<strong>一处都没用</strong>，而 JD 要求理解 checkpoint 与状态管理。</li>
+                </ul>
+                <blockquote>技术面试官判断：技术栈广度够，但每一条都停在名词层，追问一层就空。</blockquote>`,
+            },
+            { role: 'ai', speaker: 'HR 面试官', time: '14:31', html: `<p>我这边补一条：<strong>全篇零量化</strong>。「优化了查询性能」「提升了响应速度」——没有任何数字，我无法判断你的贡献大小。</p><p>建议先解决硬门槛，再谈技术深度。</p>` },
+            { role: 'ai', speaker: '诊断报告', time: '14:32', html: REPORT_CARD },
+            { role: 'user', text: '第 2 条具体怎么改？给我一句能直接粘进简历的', time: '14:35' },
+            {
+              role: 'ai',
+              speaker: '改写教练',
+              time: '14:35',
+              html: `<p>直接把那句「使用 Redis 缓存热点商品数据，优化了查询性能」换成下面这句：</p>
+                <blockquote>使用 Redis 缓存商品详情与订单热点数据（String + Hash，TTL {{300}}s + 随机 {{0-60}}s 打散防雪崩），热点 key 击穿采用 Redisson 互斥锁重建；压测 JMeter {{100}} 并发下商品详情接口 P99 从 {{800}}ms 降至 {{120}}ms，缓存命中率 {{92}}%。</blockquote>
+                <p><code>{{}}</code> 里的数字用你项目的真实数据替换——<strong>面试官会追这三个数字</strong>：P99 改善幅度、并发量级、命中率。</p>`,
+            },
+          ],
+        },
+        {
+          id: 's2',
+          title: '对话 · Java 后端实习怎么准备',
+          group: '今天',
+          time: '11:20',
+          route: '通用对话 · 置信度 92%',
+          meta: '检索 13 条语料',
+          messages: [
+            { role: 'user', text: 'Java 后端实习面试一般考什么？我是 2027 届，没实习过', time: '11:12' },
+            {
+              role: 'ai',
+              speaker: '求职助理',
+              time: '11:20',
+              html: `<p>按真实面经统计，Java 后端实习一面基本是这四块，按性价比排序：</p>
+                <table>
+                  <thead><tr><th>板块</th><th>高频问题</th><th class="w-[64px]">收益</th></tr></thead>
+                  <tbody>
+                    <tr><td>Java 基础</td><td>HashMap 扩容、线程池参数、ConcurrentHashMap</td><td>高</td></tr>
+                    <tr><td>JVM</td><td>内存区域、OOM 定位、jstat/jmap 排查</td><td>高</td></tr>
+                    <tr><td>中间件</td><td>Redis 缓存穿透/雪崩、分布式锁、Kafka 幂等</td><td>高</td></tr>
+                    <tr><td>MySQL</td><td>索引与最左匹配、事务隔离级别、explain</td><td>中</td></tr>
+                  </tbody>
+                </table>
+                <blockquote>来自检索语料 [java_exp_003] 的一面记录：面试官从 HashMap 扩容问到缓存穿透，全程围绕「你有没有踩过坑」展开。</blockquote>
+                <p>没有实习经历不是硬伤，<strong>项目里有没有可追问的细节才是</strong>。先挑一个项目把上面四块各打一枪。</p>`,
+            },
+          ],
+        },
+        {
+          id: 's3',
+          title: '对话 · Redis 缓存穿透怎么答',
+          group: '昨天',
+          time: '21:04',
+          route: '通用对话 · 置信度 88%',
+          meta: '检索 13 条语料',
+          messages: [
+            { role: 'user', text: '面试官问缓存穿透怎么防，标准答案是什么', time: '20:58' },
+            {
+              role: 'ai',
+              speaker: '求职助理',
+              time: '21:04',
+              html: `<p>别背定义，先给判断再给方案，按「现象 → 两种解法 → 代价」三段说：</p>
+                <ul>
+                  <li><strong>布隆过滤器</strong>：把存在的 key 预加载进位图，不存在直接拦掉；代价是<strong>有误判、删除 key 麻烦</strong>；</li>
+                  <li><strong>空值缓存</strong>：查不到也写一个短 TTL 的空值；代价是<strong>占内存、要防恶意刷</strong>。</li>
+                </ul>
+                <p>加分答法：说明两者怎么配合——布隆挡绝大部分，空值兜误判，并对同一 key 做短时上锁防缓存击穿。</p>`,
+            },
+          ],
+        },
+        {
+          id: 's4',
+          title: '简历诊断 · Java 后端开发',
+          group: '更早',
+          time: '09-19',
+          route: '简历诊断 · 置信度 97%',
+          meta: 'JD 8 篇 / 面经 5 篇 · 2 轮收敛',
+          messages: [
+            { role: 'user', text: '帮我诊断这份简历，目标 Java 后端开发实习生', attach: '李雷_简历v3.pdf · 11KB', time: '09-19 16:02' },
+            {
+              role: 'ai',
+              speaker: '技术面试官',
+              time: '09-19 16:04',
+              html: `<p>直接说：<strong>求职意向写的是「大数据开发实习生」，投的是 Java 后端</strong>，这是硬性方向不匹配，会被判定为目标不清。</p>
+                <p>另外 <code>Spring Boot</code> 只有「搭建接口」这一句，没有 IoC/AOP/事务失效的任何内容，而 JD 明确要求理解实现原理。</p>`,
+            },
+          ],
+        },
+      ]
+
+      const SUGGESTIONS = [
+        { icon: '📄', text: '帮我诊断这份简历，目标大数据开发实习生' },
+        { icon: '🎯', text: '第 2 条致命弱点具体怎么改？' },
+        { icon: '🧠', text: 'Java 后端实习面试高频考点有哪些' },
+        { icon: '🗺️', text: '给我一份 12 周冲刺路线图' },
+      ]
+
+      let currentId = sessions[0].id
+      let pendingAttachment = ''
+      let busy = false
+
+      const $ = (id) => document.getElementById(id)
+
+      /* ------------------------------ 渲染：会话列表 ------------------------------ */
+      function renderSessions() {
+        const keyword = ($('search').value || '').trim().toLowerCase()
+        const groups = {}
+        sessions
+          .filter((s) => !keyword || s.title.toLowerCase().includes(keyword))
+          .forEach((s) => {
+            ;(groups[s.group] = groups[s.group] || []).push(s)
+          })
+
+        const html = Object.keys(groups)
+          .map(
+            (group) => `
+          <div class="mb-1">
+            <div class="px-3 pb-1 pt-3 font-mono text-[10px] uppercase tracking-[0.2em] text-ink-3">${group}</div>
+            ${groups[group]
+              .map(
+                (s) => `
+              <div
+                class="group relative mb-0.5 flex cursor-pointer items-start gap-2 rounded-xl border border-transparent px-3 py-2.5 transition
+                  ${s.id === currentId ? 'border-seal/40 bg-seal/5' : 'hover:bg-white/70'}"
+                onclick="switchSession('${s.id}')"
+              >
+                <div class="min-w-0 flex-1">
+                  <div class="truncate text-[13px] ${s.id === currentId ? 'text-ink' : 'text-ink-2'}">${escapeHtml(s.title)}</div>
+                  <div class="mt-1 flex items-center gap-2">
+                    <span class="font-mono text-[10px] text-ink-3">${s.messages.length} 条</span>
+                    <span class="truncate font-mono text-[10px] text-ink-3">${s.time}</span>
+                  </div>
+                </div>
+                <button
+                  class="hidden shrink-0 rounded-md p-1 text-ink-3 transition hover:bg-paper-3 hover:text-seal group-hover:block"
+                  onclick="event.stopPropagation(); deleteSession('${s.id}')"
+                  title="删除会话"
+                >
+                  <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                    <path d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </div>`,
+              )
+              .join('')}
+          </div>`,
+          )
+          .join('')
+
+        $('sessionList').innerHTML =
+          html ||
+          `<div class="px-4 py-8 text-center font-serif text-[13px] text-ink-3">没有匹配的会话</div>`
+        $('sessionCount').textContent = `${sessions.length} 个会话`
+      }
+
+      /* ------------------------------ 渲染：消息区 ------------------------------ */
+      function renderMessages() {
+        const session = current()
+        $('chatTitle').textContent = session.title
+        $('chatMeta').textContent = session.meta || ''
+        const badge = $('routeBadge')
+        if (session.route) {
+          badge.textContent = session.route
+          badge.className =
+            'inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-seal bg-seal/5 px-2 py-[2px] font-mono text-[10px] tracking-wide text-seal-ink pop'
+        } else {
+          badge.className = 'hidden'
+        }
+
+        if (!session.messages.length) {
+          $('messages').innerHTML = `
+            <div class="mx-auto flex max-w-2xl flex-col items-center pt-16 text-center">
+              <div class="grid h-14 w-14 place-items-center rounded-2xl border-2 border-seal bg-white/60 font-serif text-[22px] text-seal-ink rotate-[-6deg]">诊</div>
+              <h2 class="mt-5 font-serif text-[22px]">今天想让面试官挑哪份简历的刺？</h2>
+              <p class="mt-2 max-w-md text-[13px] leading-relaxed text-ink-2">
+                上传简历、写下目标岗位，两位面试官会先当面对质，再给你一份可复制的纯文本报告与 12 周冲刺路线图。
+              </p>
+              <div class="mt-7 grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
+                ${SUGGESTIONS.map(
+                  (s) => `
+                  <button
+                    class="flex items-center gap-3 rounded-xl border border-rule bg-white px-4 py-3 text-left text-[13px] text-ink-2 transition hover:-translate-y-px hover:border-ink/30 hover:shadow-bubble"
+                    onclick="fillInput('${s.text}')"
+                  >
+                    <span class="text-base">${s.icon}</span>
+                    <span class="min-w-0 flex-1">${s.text}</span>
+                  </button>`,
+                ).join('')}
+              </div>
+            </div>`
+          return
+        }
+
+        $('messages').innerHTML = `
+          <div class="mx-auto flex max-w-3xl flex-col gap-6">
+            ${session.messages.map((m, i) => (m.role === 'user' ? userBubble(m, i) : aiBubble(m, i))).join('')}
+          </div>`
+        scrollToBottom()
+      }
+
+      function userBubble(m, index) {
+        return `
+          <div class="flex flex-col items-end gap-1.5 rise" style="animation-delay:${Math.min(index * 0.04, 0.2)}s">
+            ${
+              m.attach
+                ? `<span class="flex items-center gap-1.5 rounded-xl border border-rule bg-white px-3 py-1.5 font-mono text-[11px] text-ink-2">📎 ${escapeHtml(m.attach)}</span>`
+                : ''
+            }
+            <div class="max-w-[76%] rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[14px] leading-relaxed text-paper shadow-bubble">
+              ${escapeHtml(m.text)}
+            </div>
+            <div class="pr-1 font-mono text-[10px] text-ink-3">${m.time}</div>
+          </div>`
+      }
+
+      function aiBubble(m, index) {
+        return `
+          <div class="group flex gap-3 rise" style="animation-delay:${Math.min(index * 0.04, 0.2)}s">
+            <div class="grid h-8 w-8 shrink-0 place-items-center rounded-[10px] border border-rule bg-white font-serif text-[13px] text-seal-ink">诊</div>
+            <div class="min-w-0 flex-1">
+              <div class="mb-1.5 flex items-center gap-2">
+                <span class="text-[12.5px] text-ink-2">${escapeHtml(m.speaker || '助手')}</span>
+                <span class="font-mono text-[10px] text-ink-3">${m.time || ''}</span>
+              </div>
+              <div class="md rounded-2xl rounded-tl-md border border-rule bg-white px-4 py-3 text-[14px] text-ink-2 shadow-bubble">
+                ${m.html}
+              </div>
+              <div class="mt-1.5 flex items-center gap-1 opacity-0 transition group-hover:opacity-100">
+                <button class="rounded-md px-1.5 py-0.5 font-mono text-[10px] text-ink-3 hover:bg-paper-3 hover:text-ink" onclick="copyText(this)">复制</button>
+                <button class="rounded-md px-1.5 py-0.5 font-mono text-[10px] text-ink-3 hover:bg-paper-3 hover:text-ink">重新生成</button>
+                <button class="rounded-md px-1.5 py-0.5 font-mono text-[10px] text-ink-3 hover:bg-paper-3 hover:text-ink">有帮助</button>
+              </div>
+            </div>
+          </div>`
+      }
+
+      function thinkingBubble(label) {
+        return `
+          <div id="thinking" class="flex gap-3 rise">
+            <div class="grid h-8 w-8 shrink-0 place-items-center rounded-[10px] border border-rule bg-white font-serif text-[13px] text-seal-ink">诊</div>
+            <div class="min-w-0 flex-1">
+              <div class="mb-1.5 flex items-center gap-2">
+                <span id="thinkingLabel" class="text-[12.5px] text-ink-2">${label}</span>
+                <span class="rounded-full border border-seal bg-seal/5 px-2 py-[1px] font-mono text-[10px] text-seal-ink pop">已识别意图</span>
+              </div>
+              <div class="inline-flex items-center gap-1.5 rounded-2xl rounded-tl-md border border-rule bg-white px-4 py-3 shadow-bubble">
+                <span class="dot h-1.5 w-1.5 rounded-full bg-seal"></span>
+                <span class="dot h-1.5 w-1.5 rounded-full bg-seal" style="animation-delay:.15s"></span>
+                <span class="dot h-1.5 w-1.5 rounded-full bg-seal" style="animation-delay:.3s"></span>
+              </div>
+            </div>
+          </div>`
+      }
+
+      /* ------------------------------ 交互 ------------------------------ */
+
+      /* 主题化对话框：confirm / prompt 的替代实现（返回 Promise） */
+      let dialogResolver = null
+      let dialogNeedsInput = false
+
+      function showDialog({ title, desc, okText, danger = true, input = false, value = '', hint = '' }) {
+        $('dialogTitle').textContent = title
+        $('dialogDesc').textContent = desc || ''
+        $('dialogDesc').style.display = desc ? '' : 'none'
+        $('dialogEyebrow').textContent = danger ? '不可撤销的操作' : '请确认'
+        $('dialogSeal').textContent = danger ? '慎' : '问'
+        $('dialogSeal').className = danger
+          ? 'grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[10px] border-2 border-seal bg-seal/5 font-serif text-[15px] text-seal-ink'
+          : 'grid h-[34px] w-[34px] shrink-0 place-items-center rounded-[10px] border-2 border-ink font-serif text-[15px] text-ink'
+        $('dialogOk').textContent = okText || '确认'
+        $('dialogField').style.display = input ? '' : 'none'
+        $('dialogHint').textContent = hint
+        $('dialogInput').value = value
+        dialogNeedsInput = input
+        const mask = $('dialogMask')
+        mask.style.display = 'grid'
+        setTimeout(() => (input ? $('dialogInput') : $('dialogOk')).focus(), 30)
+        return new Promise((resolve) => {
+          dialogResolver = resolve
+        })
+      }
+
+      function resolveDialog(result) {
+        $('dialogMask').style.display = 'none'
+        const resolve = dialogResolver
+        dialogResolver = null
+        resolve?.(result)
+      }
+
+      function submitDialog() {
+        resolveDialog(dialogNeedsInput ? $('dialogInput').value.trim() : true)
+      }
+
+      const askConfirm = (title, desc, okText) => showDialog({ title, desc, okText })
+      const askPrompt = (title, value, desc) =>
+        showDialog({ title, desc, value, input: true, okText: '保存', danger: false })
+
+      $('dialogInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') submitDialog()
+        if (e.key === 'Escape') resolveDialog(null)
+      })
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && $('dialogMask').style.display === 'grid') resolveDialog(dialogNeedsInput ? null : false)
+      })
+
+      function current() {
+        return sessions.find((s) => s.id === currentId)
+      }
+
+      function switchSession(id) {
+        currentId = id
+        renderSessions()
+        renderMessages()
+        toggleSidebar(false)
+      }
+
+      function createSession() {
+        const now = new Date()
+        const id = 's' + Date.now()
+        sessions.unshift({
+          id,
+          title: '新对话',
+          group: '今天',
+          time: now.toTimeString().slice(0, 5),
+          route: '',
+          meta: '等待你的第一句话',
+          messages: [],
+        })
+        currentId = id
+        renderSessions()
+        renderMessages()
+        $('input').focus()
+      }
+
+      async function deleteSession(id) {
+        const target = sessions.find((s) => s.id === id)
+        if (!target) return
+        const ok = await askConfirm(
+          `删除会话「${target.title}」？`,
+          '会话里的消息与诊断报告会一并删除，且无法撤销。',
+          '删除',
+        )
+        if (!ok) return
+        sessions = sessions.filter((s) => s.id !== id)
+        if (!sessions.length) createSession()
+        else if (currentId === id) switchSession(sessions[0].id)
+        else renderSessions()
+      }
+
+      async function clearCurrent() {
+        const session = current()
+        if (!session || !session.messages.length) return
+        const ok = await askConfirm(
+          '清空当前会话的消息？',
+          '只清空消息，会话本身会保留；这个操作无法撤销。',
+          '清空',
+        )
+        if (!ok) return
+        session.messages = []
+        session.route = ''
+        session.meta = '已清空'
+        renderMessages()
+        renderSessions()
+      }
+
+      async function renameCurrent() {
+        const session = current()
+        const next = await askPrompt('重命名会话', session.title, '名字只影响列表显示，用来区分不同岗位或版本的简历。')
+        if (!next) return
+        session.title = next
+        renderSessions()
+        renderMessages()
+      }
+
+      function fillInput(text) {
+        $('input').value = text
+        autoGrow()
+        $('input').focus()
+      }
+
+      function mockUpload(input) {
+        const file = input.files && input.files[0]
+        if (!file) return
+        pendingAttachment = `${file.name} · ${(file.size / 1024).toFixed(0)}KB`
+        const chip = $('attachChip')
+        chip.textContent = '📎 ' + pendingAttachment
+        chip.className =
+          'inline-flex items-center gap-1 rounded-lg bg-seal/5 px-2 py-1.5 font-mono text-[11px] text-seal-ink pop'
+        input.value = ''
+      }
+
+      /* 发送：本地插入用户消息 → 识别意图 → 逐字输出回复 */
+      function send() {
+        if (busy) return
+        const text = $('input').value.trim()
+        if (!text && !pendingAttachment) return
+        const session = current()
+
+        const now = new Date().toTimeString().slice(0, 5)
+        session.messages.push({ role: 'user', text, attach: pendingAttachment, time: now })
+        if (session.title === '新对话') {
+          session.title = text.toLowerCase().includes('简历') || pendingAttachment
+            ? `简历诊断 · ${$('targetRole').value || '目标岗位待定'}`
+            : `对话 · ${text.slice(0, 12)}`
+        }
+        pendingAttachment = ''
+        $('attachChip').className = 'hidden'
+        $('input').value = ''
+        autoGrow()
+        session.time = now
+        renderSessions()
+        renderMessages()
+
+        busy = true
+        $('sendBtn').disabled = true
+
+        const mode = $('mode').value
+        const forced = mode === 'resume_diagnosis' ? '简历诊断' : mode === 'chat' ? '通用对话' : ''
+        const guess = forced || (text.includes('简历') || /诊断|JD|岗位/.test(text) ? '简历诊断' : '通用对话')
+        const sessionNode = $('messages')
+        sessionNode.insertAdjacentHTML('beforeend', `<div class="mx-auto max-w-3xl w-full">${thinkingBubble('正在识别意图…')}</div>`)
+        scrollToBottom()
+
+        const label = guess === '简历诊断' ? '技术面试官' : '求职助理'
+        const reply = buildReply(guess, text)
+
+        setTimeout(() => {
+          const thinking = $('thinking')
+          if (thinking) {
+            $('thinkingLabel').textContent = label
+          }
+        }, 700)
+
+        setTimeout(() => {
+          const thinking = $('thinking')
+          if (thinking) thinking.closest('.mx-auto')?.remove()
+          const holder = document.createElement('div')
+          holder.className = 'mx-auto max-w-3xl w-full'
+          sessionNode.appendChild(holder)
+          streamInto(holder, label, reply, () => {
+            session.messages.push({ role: 'ai', speaker: label, time: new Date().toTimeString().slice(0, 5), html: reply })
+            session.route = guess === '简历诊断' ? '简历诊断 · 置信度 94%' : '通用对话 · 置信度 91%'
+            session.meta = guess === '简历诊断' ? 'JD 8 篇 / 面经 5 篇' : '检索 13 条语料'
+            busy = false
+            $('sendBtn').disabled = false
+            renderSessions()
+            renderMessages()
+          })
+        }, 1400)
+      }
+
+      /* 逐字输出（先流式吐纯文本，结束后替换成带样式的 HTML） */
+      function streamInto(holder, speaker, html, done) {
+        const plain = html
+          .replace(/<br\s*\/?>/g, '\n')
+          .replace(/<\/(p|li|h3|blockquote|tr)>/g, '\n')
+          .replace(/<[^>]+>/g, '')
+          .replace(/\n{3,}/g, '\n\n')
+          .trim()
+        holder.innerHTML = `
+          <div class="flex gap-3">
+            <div class="grid h-8 w-8 shrink-0 place-items-center rounded-[10px] border border-rule bg-white font-serif text-[13px] text-seal-ink">诊</div>
+            <div class="min-w-0 flex-1">
+              <div class="mb-1.5 text-[12.5px] text-ink-2">${speaker}</div>
+              <div class="md typing rounded-2xl rounded-tl-md border border-rule bg-white px-4 py-3 text-[14px] text-ink-2 shadow-bubble" id="streamBody"></div>
+            </div>
+          </div>`
+        const body = holder.querySelector('#streamBody')
+        let i = 0
+        const timer = setInterval(() => {
+          i += 6
+          body.textContent = plain.slice(0, i)
+          scrollToBottom()
+          if (i >= plain.length) {
+            clearInterval(timer)
+            body.classList.remove('typing')
+            body.innerHTML = html
+            scrollToBottom()
+            done()
+          }
+        }, 18)
+      }
+
+      function buildReply(kind, text) {
+        if (kind === '简历诊断') {
+          return `<p>收到，我按「目标岗位 → 硬性门槛 → 技术深度 → 产出量化」的顺序先过一遍：</p>
+            <ul>
+              <li><strong>先确认两件事</strong>：可实习起止时间（JD 要求 6 个月以上）、期望城市是否与岗位一致；</li>
+              <li><strong>再看技术证据</strong>：技能栏里每一项都要能在项目里找到场景，否则面试官一层追问就会空；</li>
+              <li><strong>最后补数字</strong>：QPS、P99、数据量、命中率，至少给两个。</li>
+            </ul>
+            <blockquote>这条是示意回复。真实环境里会跑完整链路：解析简历 → 检索 JD 与面经 → 技术面试官与 HR 面试官多轮对抗 → 输出纯文本报告。</blockquote>`
+        }
+        return `<p>先说结论，再给依据。</p>
+          <p>你问的是「${escapeHtml(text.slice(0, 24))}${text.length > 24 ? '…' : ''}」。按真实面经的分布，这类问题面试官真正想确认的是<strong>你有没有踩过坑</strong>，而不是定义背得准不准。</p>
+          <ul>
+            <li>回答结构用「现象 → 两种解法 → 各自代价 → 你选了哪个」；</li>
+            <li>主动给数字和边界条件，把追问提前堵住；</li>
+            <li>回答完补一句「我们线上还遇到 X，当时是这么处理的」——这句最能拉分。</li>
+          </ul>
+          <blockquote>这条是示意回复。真实环境里会先检索语料库，命中的 JD / 面经片段会带 [来源 id] 一起给你。</blockquote>`
+      }
+
+      /* ------------------------------ 工具函数 ------------------------------ */
+      function escapeHtml(text) {
+        return String(text).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
+      }
+
+      function copyText(btn) {
+        const bubble = btn.closest('.min-w-0').querySelector('.md')
+        navigator.clipboard?.writeText(bubble.innerText).then(() => {
+          const original = btn.textContent
+          btn.textContent = '已复制'
+          setTimeout(() => (btn.textContent = original), 1400)
+        })
+      }
+
+      function scrollToBottom() {
+        const node = $('messages')
+        node.scrollTop = node.scrollHeight
+      }
+
+      function autoGrow() {
+        const el = $('input')
+        el.style.height = 'auto'
+        el.style.height = Math.min(el.scrollHeight, 160) + 'px'
+      }
+
+      function toggleSidebar(open) {
+        const sidebar = $('sidebar')
+        const backdrop = $('backdrop')
+        if (window.innerWidth > 900) {
+          sidebar.classList.remove('-translate-x-full')
+          backdrop.classList.add('hidden')
+          return
+        }
+        const show = open ?? sidebar.classList.contains('-translate-x-full')
+        sidebar.classList.toggle('-translate-x-full', !show)
+        backdrop.classList.toggle('hidden', !show)
+      }
+
+      /** 窄屏时侧栏默认收起，宽屏时永远展开 */
+      function applyResponsive() {
+        const mobile = window.innerWidth <= 900
+        $('sidebar').classList.toggle('-translate-x-full', mobile)
+        $('backdrop').classList.add('hidden')
+      }
+
+      /* ------------------------------ 事件绑定 ------------------------------ */
+      $('input').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault()
+          send()
+        }
+      })
+      $('input').addEventListener('input', autoGrow)
+      document.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'n') {
+          e.preventDefault()
+          createSession()
+        }
+      })
+
+      renderSessions()
+      renderMessages()
+      applyResponsive()
+      window.addEventListener('resize', applyResponsive)
+    </script>
+  </body>
+</html>

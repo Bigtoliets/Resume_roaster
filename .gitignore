@@ -1,0 +1,36 @@
+# 环境与密钥
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+
+# Node / 前端
+node_modules/
+dist/
+.vite/
+
+# 运行时产物
+uploads/
+*.log
+*.pdf.tmp
+
+# 真实语料不入库（仅样例语料提交）
+data/local/
+
+# 文档挂载
+docs/attachments/
+
+# 第三方源码（Langfuse 已在远端部署，本地克隆仅为参考）
+langfuse/
+
+# IDE
+.idea/
+.vscode/

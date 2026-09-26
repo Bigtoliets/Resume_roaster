@@ -1,0 +1,156 @@
+# 简历诊断 Agent 平台 · 基础设施（MySQL + Milvus + Attu），不含 Langfuse
+#
+# 全部参数已写死，无需任何 env 文件，直接：
+#     cd 本文件所在目录 && docker compose up -d
+#
+# 容器不做自动恢复（restart: "no"）：服务器重启或 Docker 重启后不会自己拉起，
+# 需要你手动执行 docker compose up -d。
+#
+# 密码为方便部署而明文写在下方，若服务器不止你一个人用，请自行修改：
+#   - MySQL 密码：本文件 mysql.environment 处
+#   - Milvus 使用的 MinIO 密码：本文件 minio.environment 处
+#   - 注意：修改 MySQL 密码后，开发机项目根目录的 .env 也要同步改
+#
+# 端口占用说明（避开 Langfuse 已占用的 3000/3030/8123/9000/9090/9091/6379/5432）：
+#   3306  MySQL（对外）
+#   19530 Milvus gRPC（对外）
+#   19091 Milvus 健康检查（仅宿主机回环，原 9091 与 Langfuse minio 冲突）
+#   8001  Attu 界面（容器内固定 3000，宿主改 8001）
+
+name: resume-roaster-infra
+
+services:
+  # ----------------------------------------------------------- MySQL
+  mysql:
+    image: mysql:latest
+    container_name: resume-mysql
+    restart: "no"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --explicit_defaults_for_timestamp=ON
+      - --max-connections=200
+      - --default-time-zone=+08:00
+    environment:
+      MYSQL_ROOT_PASSWORD: ResumeRoot2026
+      MYSQL_DATABASE: resume_roaster
+      MYSQL_USER: resume
+      MYSQL_PASSWORD: ResumeApp2026
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - resume-net
+
+  # --------------------------------- Milvus standalone：etcd + minio + milvus
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: resume-etcd
+    restart: "no"
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      - etcd
+      - -advertise-client-urls=http://etcd:2379
+      - -listen-client-urls=http://0.0.0.0:2379
+      - --data-dir=/etcd
+    volumes:
+      - etcd_data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 20s
+    networks:
+      - resume-net
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: resume-minio
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: MinioRoot2026
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio_data:/minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 20s
+    networks:
+      - resume-net
+
+  milvus:
+    image: milvusdb/milvus:v2.5.4
+    container_name: resume-milvus
+    restart: "no"
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: minioadmin
+      MINIO_SECRET_ACCESS_KEY: MinioRoot2026
+      MINIO_BUCKET_NAME: milvus-bucket
+      COMMON_STORAGETYPE: minio
+      TZ: Asia/Shanghai
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "127.0.0.1:19091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+      start_period: 90s
+    networks:
+      - resume-net
+
+  # ------------------------------------------- Attu：Milvus 可视化管理界面
+  attu:
+    image: zilliz/attu:v2.5
+    container_name: resume-attu
+    restart: "no"
+    environment:
+      # Attu 由浏览器直连 Milvus，这里必须是"浏览器可达"的地址（不能用容器名 milvus）
+      MILVUS_URL: http://192.168.10.99:19530
+    ports:
+      - "8001:3000"
+    depends_on:
+      milvus:
+        condition: service_healthy
+    networks:
+      - resume-net
+
+volumes:
+  mysql_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+
+networks:
+  resume-net:
+    driver: bridge
