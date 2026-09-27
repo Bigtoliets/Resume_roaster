@@ -22,6 +22,8 @@ class ModelConfigIn(BaseModel):
     model_name: str = ""
     default_params: dict[str, Any] = Field(default_factory=dict)
     timeout_s: int = 120
+    #: 模型的最大上下文窗口（token），窗口换页的阈值按它算比例
+    context_window: int = 65536
     is_default: bool = False
     is_enabled: bool = True
 
@@ -35,6 +37,7 @@ class ModelConfigOut(ORMBase):
     model_name: str
     default_params: dict[str, Any]
     timeout_s: int
+    context_window: int
     is_default: bool
     is_enabled: bool
     created_at: datetime
@@ -168,6 +171,8 @@ class AgentIn(BaseModel):
     skill_ids: list[int] = Field(default_factory=list)
     tool_ids: list[int] = Field(default_factory=list)
     max_rounds: int = 12
+    #: 上下文用量超过 context_window 的这个百分比就换页
+    context_threshold_pct: int = 80
     parallel_tools: bool = True
     params_override: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
@@ -184,6 +189,7 @@ class AgentOut(ORMBase):
     skill_ids: list[int]
     tool_ids: list[int]
     max_rounds: int
+    context_threshold_pct: int
     parallel_tools: bool
     params_override: dict[str, Any]
     is_enabled: bool
@@ -230,6 +236,9 @@ class ToolCallOut(ORMBase):
     requires_approval: bool
     approved: bool | None
     elapsed_ms: int
+    #: 存档坐标（D48）：指针 `W2.T3` 就是靠这两列定位到这次调用
+    window_index: int = 0
+    seq: int = 0
     created_at: datetime
 
 

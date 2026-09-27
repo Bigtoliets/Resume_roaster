@@ -55,6 +55,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -63,6 +64,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.checkpoints import (
@@ -72,11 +74,20 @@ from app.agent.checkpoints import (
     release_pending,
     wait_for_decision,
 )
+from app.agent.notes import (
+    Notes,
+    Ref,
+    normalize_notes,
+    project_notes,
+    render_window_digest,
+    verify_notes,
+)
 from app.agent.prompts import DEFAULT_AGENT_SYSTEM, render_variables
 from app.agent.tool_docs import render_tools_text
 from app.core.security import decrypt
-from app.db.models import Agent, ModelConfig, Prompt, Skill, Tool, ToolCall
+from app.db.models import Agent, Message, ModelConfig, Prompt, RunNote, Skill, Tool, ToolCall
 from app.llm.client import LLMClient, ToolCallRequest
+from app.obs.langfuse import observation as trace_span
 from app.tools.registry import build_tool_schema, execute_tool, get_impl, impl_status
 
 logger = logging.getLogger(__name__)
@@ -85,6 +96,104 @@ EmitFn = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 #: 文本协议里的 Action 标记：`Action: {...}` / `Action：{...}`
 _ACTION_RE = re.compile(r"Action\s*[:：]\s*(\{)", re.S)
+
+#: 换页后注入的续跑指令。三句话都在防同一件事：模型看到干净上下文时，
+#: 会把笔记里描述的"已完成步骤"当成"还没做"，于是从头再查一遍。
+ROLLOVER_INSTRUCTION = (
+    "【窗口硬切换完成】历史对话与所有工具返回结果已全部归档存储，当前上下文仅保留结构化任务笔记。\n"
+    "请严格按以下规则推进任务：\n\n"
+    "一、行动总则\n"
+    "1. 优先读取 plan 中的待办事项推进任务，progress 中标记已完成的步骤禁止重复执行；\n"
+    "二、按需召回规则（recall 工具使用边界）\n"
+    "✅ 仅在以下三类场景触发召回：\n"
+    "   -重点：需要引用精确原文：如简历原句、JD 任职要求原文、工具输出的完整数据/结论或者其他工具调用结果；\n"
+    "   - 笔记信息存疑、出现矛盾或缺失关键细节，必须追溯原始凭证核对。\n"
+    "❌ 以下场景禁止召回：\n"
+    "   - 笔记中已有明确结构化结论的常规推理，禁止重复调取原文；\n"
+    "   - 仅为复述已完成结论、确认常识性信息的，禁止召回；\n"
+    "   - 禁止批量召回全量历史记录，每次仅召回当前步骤必需的最少指针。\n\n"
+    "三、召回操作规范\n"
+    "1. 调用 recall 工具，传入 refs 中对应的指针（格式：W<n>.<m>）精准定位单条记录；\n"
+    "2. 召回的原始内容仅用于本轮推理，结论提炼更新进笔记后，下一轮不再携带；\n"
+    "3. 涉及数据指标、原文引用、规则条款的内容，必须召回核对后再输出，禁止凭笔记摘要臆测。\n\n"
+)
+
+#: 喂给投影的单条工具结果上限。投影输入要**够准**而不是够短：
+#: LLM 类工具（面试官 / 终裁）的真实输出只有 1~2k 字，全给也就几百 token；
+#: 而只给"给 UI 看的 200 字预览"会让投影把省略号误判成「内容被截断」，
+#: 写进笔记后再由主模型照着执行——实测一整个回合都在反复回查、重跑同一个面试官工具。
+DIGEST_EXCERPT_CHARS = 1500
+
+#: 一个回合最多换几次页。硬上限，保证回合一定走得完：
+#: 换页会丢弃本轮已决定的动作（模型要带着新笔记重新决策），窗口设得太小时
+#: 会变成"取回原文→换页丢弃→再取回"的活锁。到达上限就本回合停用换页。
+MAX_ROLLOVERS_PER_TURN = 8
+
+async def prune_dead_refs(db: AsyncSession, notes: Notes, run_id: int | None) -> int:
+    """把指向**不存在的存档行**的 refs 丢掉，返回丢掉几条。
+
+    为什么需要它：投影会从窗口记录里"抄编号"。回查结果里若出现 `未命中：W1.T5`，
+    它就把 `W1.T5` 当成有效指针抄进 refs —— 而那一行根本不存在。
+    下游模型照着 refs 去回查，永远查不到，于是开始**猜编号**（实测连续 11 次 recall、
+    3 次报错）。提示词已经禁止写"没查到"的指针，这里再兜一道底：
+    **refs 里只允许留活指针**。
+    """
+    if run_id is None or not notes.refs:
+        return 0
+    from app.agent.notes import POINTER_RE
+
+    kept: list[Ref] = []
+    for ref in notes.refs:
+        match = POINTER_RE.match(ref.pointer or "")
+        if match is None:
+            continue
+        window, kind, seq = int(match.group(1)), match.group(2), int(match.group(3))
+        model = Message if kind == "M" else ToolCall
+        hit = (
+            await db.execute(
+                select(model.id)
+                .where(
+                    model.run_id == run_id,
+                    model.window_index == window,
+                    model.seq == seq,
+                )
+                .limit(1)
+            )
+        ).first()
+        if hit is not None:
+            kept.append(ref)
+    dropped = len(notes.refs) - len(kept)
+    notes.refs = kept
+    return dropped
+
+
+def digest_entry_text(observation: dict[str, Any]) -> str:
+    """挑出投影应该看的内容：优先工具的真实输出，其次才是摘要。
+
+    `observation["summary"]` 是给前端和列表用的预览（LLM 类工具是 `前 200 字 + …`），
+    直接拿它当投影输入就会让投影以为内容被截断。这里改取 `data.text`（工具的真实正文），
+    结构化结果（如检索工具的 `data.items`）则序列化整个 `data`，并在结尾标出**真实总字数**——
+    否则只回退到 19 个字的一句话摘要，投影会把它读成"这个结果只有 19 字"（实测踩过：
+    模型因此以为检索内容丢了，又去回查一遍）。
+    """
+    data = observation.get("data")
+    if isinstance(data, dict) and str(data.get("text") or "").strip():
+        # LLM 类工具（面试官 / 终裁）：正文就是 data.text
+        body = str(data["text"]).strip()
+    elif data:
+        # 结构化结果（检索命中列表等）：整体序列化，别只留一句摘要
+        body = json.dumps(data, ensure_ascii=False)
+    else:
+        body = str(observation.get("summary") or "")
+        body = body.strip()
+    if not body:
+        return ""
+    if len(body) > DIGEST_EXCERPT_CHARS:
+        return (
+            f"{body[:DIGEST_EXCERPT_CHARS]}…"
+            f"[此处仅摘录，完整结果共 {len(body)} 字，需要明细请按指针回查]"
+        )
+    return f"{body}（完整结果共 {len(body)} 字）"
 
 
 def _extract_json_object(text: str, start: int) -> str | None:
@@ -361,7 +470,13 @@ def build_tool_schemas(tools: list[Tool]) -> list[dict[str, Any]]:
     return schemas
 
 
-async def _invoke_parallel(call: Any, tool_id: int, llm: LLMClient) -> tuple[Any, dict[str, Any], str, int]:
+async def _invoke_parallel(
+    call: Any,
+    tool_id: int,
+    llm: LLMClient,
+    session_id: int | None = None,
+    run_id: int | None = None,
+) -> tuple[Any, dict[str, Any], str, int]:
     """并发执行用：每个任务开自己的 session。
 
     `AsyncSession` 不是并发安全的（一个协程用连接时另一个不能抢），所以并发跑工具时
@@ -381,7 +496,12 @@ async def _invoke_parallel(call: Any, tool_id: int, llm: LLMClient) -> tuple[Any
             return call, {"ok": False, "summary": "工具已不存在"}, "error", 0
         # 真（正的执行入口与测试场共用）；fallback_llm 让"没单独配模型的工具"复用 Agent 的模型
         observation = await execute_tool(
-            tool_db, tool=tool, arguments=call.arguments, fallback_llm=llm
+            tool_db,
+            tool=tool,
+            arguments=call.arguments,
+            fallback_llm=llm,
+            session_id=session_id,
+            run_id=run_id,
         )
     # 工具自己返回 ok=False（配置不全、参数缺失、执行报错…）时记为 error，供前端标红
     status = "ok" if observation.get("ok", True) else "error"
@@ -398,6 +518,10 @@ class TurnResult:
     steps: list[dict[str, Any]]
     rounds: int
     tool_call_ids: list[int]
+    #: 回合结束时所在的窗口号；落库时写给这条 assistant 消息（D48 存档坐标）
+    window_index: int = 1
+    #: 这条 assistant 消息在窗口内的序号；指针 `W<window_index>.M<seq>` 靠它定位
+    seq: int = 0
 
 
 
@@ -421,17 +545,20 @@ async def run_react_turn(
     agent: Agent,
     user_content: str,
     history: list[dict[str, str]],
-    summary: str,
     attachments: list[dict[str, Any]],
     emit: EmitFn,
     approval_timeout_s: float = 180,
     checkpoint: TurnCheckpoint | None = None,
+    user_message_id: int | None = None,
 ) -> TurnResult:
     """跑完一个完整的 ReAct 回合，返回最终回答与全部步骤。
 
     参数里的 `emit` 是 SSE 推送函数：每产生一条步骤/一个 token 就推给前端一次，
     前端据此实时显示"思考 → 行动 → 观察"的进度。数据库写入则集中在回合结束时
     （消息 + 步骤 JSON），中间只落 `tool_calls` 表便于展开查看完整参数与结果。
+
+    `user_message_id` 是本轮用户消息在 messages 表里的主键（由 sessions_router 先落库再传进来）。
+    它用来给这条消息盖**存档坐标**（`window_index` + `seq`），否则笔记里的 `W1.M1` 指针永远查不到东西。
     """
     # ── 1. 解析白名单：页面勾选的工具里，哪些真的能调 ──────────────────────
     tool_rows: list[Tool] = []
@@ -457,8 +584,6 @@ async def run_react_turn(
         )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    if summary:
-        messages.append({"role": "system", "content": f"【会话摘要】\n{summary}"})
     for item in history:
         messages.append({"role": item["role"], "content": item["content"]})
 
@@ -487,6 +612,64 @@ async def run_react_turn(
     # 确认过的工具不再问，取消过的工具直接拒（避免"取消→模型换参数再来→又弹卡片"的骚扰循环）。
     approved_tools: set[str] = checkpoint.approved_tools if checkpoint is not None else set()
     cancelled_tools: set[str] = checkpoint.cancelled_tools if checkpoint is not None else set()
+
+    # ── 长上下文治理（D48）：窗口换页 + 外部记忆 ──────────────────────────
+    # 窗口 = 模型当前能看到的上下文。快满时整段换掉，任务连续性靠笔记 + 存档指针。
+    #: 换页阈值（token）。0 表示不启用（模型没配 context_window 时）。
+    window_limit = 0
+    if agent.model_config_id:
+        _model = await db.get(ModelConfig, agent.model_config_id)
+        if _model is not None and int(_model.context_window or 0) > 0:
+            pct = int(getattr(agent, "context_threshold_pct", 80) or 80)
+            window_limit = int(_model.context_window) * max(min(pct, 95), 10) // 100
+    #: 当前窗口号，每次换页 +1；指针里的 W 就是它
+    window_index = 1
+    #: 窗口内统一序号：每追加"一条可寻址的条目"（用户输入 / 工具调用 / 最终回答）+1
+    window_seq = 0
+    #: 当前笔记（物化后的任务状态），换页时注入上下文
+    notes: Notes | None = None
+    #: 上一轮的 prompt token 数与增量，用来预测"下一轮会不会顶到上限"
+    last_prompt_tokens = 0
+    last_delta = 0
+    #: 本窗口的"思考流水 + 观察摘要"，作为投影的输入（**不含**工具返回的完整 JSON）
+    window_digest: list[dict[str, Any]] = []
+    #: 最近几轮的工具调用签名，用于低效触发（连续 3 轮完全相同 = 重复试错）
+    round_signatures: list[str] = []
+    #: 模型在本窗口**最后一次 think 的原文**。换页时单独喂给投影，
+    #: 让笔记里的 `plan` 直接取它——而不是让投影器自己编一个计划。
+    latest_thought = ""
+    #: 本回合已经被换页丢过的动作签名，用来识别"原地打转"（防活锁，详见换页块）。
+    #: 必须是**集合**：被丢的动作和中间穿插的取原文动作会交替出现，
+    #: 只比"上一次被丢的那个"永远比不上（实测踩过）。
+    discarded_signatures: set[str] = set()
+    #: 本回合已换页次数，硬上限见 MAX_ROLLOVERS_PER_TURN
+    rollover_count = 0
+
+    # 本轮用户消息是窗口里的第一条**可寻址**记录 —— 它由 sessions_router 先落库，
+    # 这里补盖存档坐标（`W1.M1`）。不这么做的话，笔记里引用的 `W*.M*` 指针在
+    # recall 里永远查不到行（messages 的这两列一直是默认值 0）。
+    # 拿不到 id（老调用方）也不影响主流程，只是这条消息不能被指针回查。
+    if user_message_id:
+        user_row = await db.get(Message, user_message_id)
+        if user_row is not None:
+            window_seq += 1
+            user_row.window_index = window_index
+            user_row.seq = window_seq
+            window_digest.append(
+                {"pointer": f"W{window_index}.M{window_seq}", "kind": "user", "text": user_content[:300]}
+            )
+            await db.commit()
+
+    # 换页有个**硬前提**：模型必须能按指针把原文查回来，也就是白名单里得有 `recall`。
+    # 少了它，换页等于"原文彻底丢失"——实测就是这么翻车的：模型回查失败后，
+    # 只能转头让用户"重新上传一次简历"。这里只告警不阻断（少一次提示好过卡死整条链路）。
+    if window_limit > 0 and "recall" not in whitelist:
+        logger.warning(
+            "Agent #%s 启用了换页（阈值 %s tokens）但白名单里没有 recall 工具："
+            "换页后模型无法回查原文。请在 Agents 页把「回查存档」勾上。",
+            agent.id,
+            window_limit,
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # 主循环：每一轮 = 一次 LLM 调用 + 它要求的工具调用 + 结果回灌
@@ -517,6 +700,20 @@ async def run_react_turn(
             tools=schema_tools or None,
             on_token=on_token,
             new_from=new_from,
+        )
+
+        # 换页到底有没有生效，看这一行最直接：换页后上下文条数应该**掉回个位数**
+        # （system + 笔记 + 续跑指令 + 本轮自身的 assistant/tool），prompt 也应该掉回去。
+        # 不打印的话，"换了页但模型还像记得之前的事"根本没法区分是没切成还是模型在猜。
+        logger.info(
+            "轮 %s｜窗口 W%s｜上下文 %s 条｜prompt=%s + completion=%s = %s tokens（换页点 %s）",
+            round_index,
+            window_index,
+            len(messages),
+            result.prompt_tokens,
+            result.completion_tokens,
+            result.prompt_tokens + result.completion_tokens,
+            window_limit or "未启用",
         )
 
         # ── 识别模型这轮想干什么：兼容两种协议，提示词用哪版都不会卡 ──────────
@@ -554,12 +751,225 @@ async def run_react_turn(
             final_text = result.content or "（模型没有返回内容）"
             break
 
+        # 低效触发的依据：本轮调了哪些工具、参数是什么。
+        # 连续几轮完全一致 = 典型的重复试错，该换页把垃圾信息清掉了。
+        round_signatures.append(
+            "|".join(
+                sorted(
+                    f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+                    for call in result.tool_calls
+                )
+            )
+        )
+
+        # ── 换页判断（D57）：位置在 **think 之后、act 之前** ────────────────
+        # 模型刚说完要调哪些工具，但还没真正执行。选这个位置的理由：
+        #   1. 本轮工具的返回会**直接落在新窗口里**。放在轮末（observation 之后）时，
+        #      刚拿到的结果立刻被投影压成摘要，下一轮只能按指针回查一遍 —— 这是之前
+        #      最主要的空转来源（实测一个回合 7 次回查都在搬同一批材料）。
+        #   2. 判断用的 token 数来自刚结束的这次 LLM 调用的真实 usage，和放轮末一样准。
+        # `latest_thought` 在这一刻就是 `result.content`（模型刚说要干什么），
+        # 笔记里的 plan 直接取它。
+        last_delta = (
+            result.prompt_tokens + result.completion_tokens - last_prompt_tokens
+            if last_prompt_tokens
+            else 0
+        )
+        last_prompt_tokens = result.prompt_tokens + result.completion_tokens
+
+        triggers: list[str] = []
+        if window_limit > 0 and last_prompt_tokens >= window_limit:
+            triggers.append("hard_threshold")  # 本轮用量已经越过阈值
+        if (
+            window_limit > 0
+            and last_delta > 0
+            and last_prompt_tokens + last_delta >= window_limit
+        ):
+            triggers.append("projected_overflow")  # 按上轮增量外推，下一轮就会顶到上限
+        if len(round_signatures) >= 3 and len(set(round_signatures[-3:])) == 1:
+            triggers.append("stalled_retry")  # 连续 3 轮工具与参数完全相同 = 重复试错
+
+        # ── 防活锁：换页后"重新决策"不能变成"永远在原地重新决策" ─────────────
+        # 换页按设计会丢掉本轮已决定的动作（让模型带着新笔记重新判断）。
+        # 但窗口太小时会变成：
+        #   取回原文 → 换页丢掉"调面试官" → 新窗口原文没了 → 再取回来 → 又丢掉…
+        # 两条保险：
+        #   1. 同一个动作**被丢过一次之后**再出现，就不再换页、直接执行
+        #      （模型重新判断后还是同一件事，说明这个动作不受换页影响）；
+        #   2. 一回合换页总数封顶（MAX_ROLLOVERS_PER_TURN），到顶就停用换页。
+        this_signature = round_signatures[-1] if round_signatures else ""
+        if triggers and this_signature and this_signature in discarded_signatures:
+            logger.warning(
+                "换页原地打转：这个动作已被丢过一次，本次不换页、直接执行（%s）",
+                this_signature[:120],
+            )
+            triggers = []
+        elif triggers and rollover_count >= MAX_ROLLOVERS_PER_TURN:
+            logger.warning(
+                "本回合换页已达上限 %s 次，停用换页让它跑完（窗口可能设得太小）",
+                MAX_ROLLOVERS_PER_TURN,
+            )
+            await emit(
+                "stage",
+                {
+                    "stage": "rollover_disabled",
+                    "reason": f"本回合换页已达上限 {MAX_ROLLOVERS_PER_TURN} 次，先跑完这一轮",
+                },
+            )
+            window_limit = 0
+            triggers = []
+
+        rolled_this_round = False
+        if triggers:
+            latest_thought = result.content or latest_thought
+            with trace_span(
+                "memory-rollover",
+                as_type="span",
+                input={
+                    "window_index": window_index,
+                    "tokens": last_prompt_tokens,
+                    "window_limit": window_limit,
+                    "digest_entries": len(window_digest),
+                    "rounds_in_window": len(round_signatures),
+                    "at": "think->act",  # 换页发生在 think 之后、act 之前
+                },
+                metadata={
+                    "trigger": triggers,
+                    "delta_tokens": last_delta,
+                    "context_threshold_pct": int(
+                        getattr(agent, "context_threshold_pct", 80) or 80
+                    ),
+                    "session_id": session_id,
+                    "run_id": run_id,
+                },
+            ) as rollover_span:
+                candidate: Notes | None = None
+                problems: list[str] = []
+                dropped_refs = 0
+                dropped_steps = 0  # 被 normalize 丢掉的"非工具步骤"条数
+                try:
+                    candidate = await project_notes(
+                        llm=llm,
+                        previous=notes,
+                        window_digest=render_window_digest(window_digest),
+                        latest_thought=latest_thought,
+                    )
+                    refs_before = len(candidate.refs)
+                    steps_before = len(candidate.progress.stage)
+                    # 传 whitelist 进去：`progress.stage` 只允许记"真实工具干的事"，
+                    # 非工具步骤（"直接判断：…"）会被丢掉。
+                    # window_tool_names 是"本窗口真的跑过、并且留下指针的工具"，
+                    # 用来挡住"把思考当成已完成"这种编造进度。
+                    candidate = normalize_notes(
+                        candidate,
+                        notes,
+                        tool_names=whitelist,
+                        window_tool_names={
+                            str(item.get("tool"))
+                            for item in window_digest
+                            if item.get("kind") == "tool" and item.get("pointer") and item.get("tool")
+                        },
+                    )
+                    dropped_steps = steps_before - len(candidate.progress.stage)
+                    dropped_refs = refs_before - len(candidate.refs)
+                    # 再兜一道底：refs 里只留**真实存在**的存档指针
+                    dropped_refs += await prune_dead_refs(db, candidate, run_id)
+                    problems = verify_notes(candidate, notes)
+                except Exception as exc:  # noqa: BLE001 - 投影失败绝不能影响主流程
+                    logger.warning("笔记投影失败，本次不换页：%s", exc)
+                    candidate, problems = None, ["投影调用失败"]
+
+                if candidate is not None and not problems:
+                    db.add(
+                        RunNote(
+                            run_id=run_id or 0,
+                            session_id=session_id,
+                            window_index=window_index + 1,
+                            content=candidate.model_dump(),
+                        )
+                    )
+                    await db.commit()
+                    notes = candidate
+                    window_index += 1
+                    window_seq = 0
+                    window_digest = []
+                    round_signatures = []
+                    rolled_this_round = True
+                    # 清空窗口并重建。**这一步发生在 assistant(tool_calls) 写进上下文之前**，
+                    # 所以接下来那句 assistant 消息和它引发的 tool 返回都会落在新窗口里，
+                    # assistant(tool_calls)/tool 的配对不会被切断（OpenAI 协议要求成对）。
+                    messages.clear()
+                    messages.extend(
+                        [
+                            {"role": "system", "content": system_prompt},
+                            {
+                                "role": "system",
+                                "content": f"【任务笔记】\n{notes.model_dump_json(indent=2)}",
+                            },
+                            {"role": "user", "content": ROLLOVER_INSTRUCTION},
+                        ]
+                    )
+                    await emit("stage", {"stage": "rollover", "window_index": window_index})
+                    logger.info(
+                        "上下文换页：窗口 %s（%s tokens / 上限 %s）",
+                        window_index,
+                        last_prompt_tokens,
+                        window_limit,
+                    )
+                    if rollover_span is not None:
+                        with contextlib.suppress(Exception):
+                            rollover_span.update(
+                                output={
+                                    "rolled": True,
+                                    "new_window_index": window_index,
+                                    "note": candidate.model_dump(),
+                                    "dropped_refs": dropped_refs,
+                                    "dropped_non_tool_steps": dropped_steps,
+                                    # 换页后**不执行**本轮已决定的动作：模型带着新笔记重新决策
+                                    "executed_pending_actions": False,
+                                }
+                            )
+                    # ★ 换页后让模型**带着新笔记重新决策**，而不是照着旧上下文里定好的动作往下跑。
+                    # 这正是"按需回查"能发生的前提：模型先读到新笔记，判断缺什么原文，
+                    # 再用 refs 里的指针去 recall。丢掉本轮的 tool_calls（continue），
+                    # 下一轮它会重新想一遍。
+                    rollover_count += 1
+                    if this_signature:
+                        discarded_signatures.add(this_signature)
+                    continue
+                else:
+                    # 校验不通过就不换 —— 宁可上下文继续涨，也不能带着残缺笔记进新窗口
+                    logger.warning("笔记校验未通过，本次不换页：%s", problems)
+                    if rollover_span is not None:
+                        with contextlib.suppress(Exception):
+                            rollover_span.update(
+                                output={
+                                    "rolled": False,
+                                    "problems": problems,
+                                    "dropped_refs": dropped_refs,
+                                    "note": candidate.model_dump() if candidate else None,
+                                }
+                            )
+
         # 模型可能先嘀咕几句再决定调工具。这段嘀咕作为一条"思考"落库 + 推送。
         # `[:600]` 是防止它长篇大论把消息表撑爆（完整内容不需要留）。
         if result.content:
             thought = Step(type="thought", text=result.content[:600])
             steps.append(thought)
             await emit("step", thought.dump())
+            # 这一段就是"act 之前的 think"：模型刚说完要做什么，紧接着才调工具。
+            # 笔记的 plan 要的就是它。
+            latest_thought = result.content
+            # 投影输入：思考流水（不带指针——它只体现"模型当时的判断"，不需要回查原文）
+            # 带上轮次：投影时 `decisions[].round` 就靠它，不写模型只能瞎猜。
+            window_digest.append(
+                {
+                    "pointer": "",
+                    "kind": "thought",
+                    "text": result.content[:300],
+                    "round": round_index,
+                }
+            )
 
         # ── 把这一轮的 assistant 回复写进上下文（下一步回灌观察结果的前提）──────
         # 两种协议的写法不同，但作用一样：把"模型说了什么/要调什么"记进历史。
@@ -612,7 +1022,13 @@ async def run_react_turn(
                 outcomes = await asyncio.gather(
                     *[
                         # 每个任务自己开会话（AsyncSession 不是并发安全的）
-                        _invoke_parallel(call, tools_by_name[call.name].id, llm)
+                        _invoke_parallel(
+                            call,
+                            tools_by_name[call.name].id,
+                            llm,
+                            session_id=session_id,
+                            run_id=run_id,
+                        )
                         for call in pending
                     ]
                 )
@@ -665,6 +1081,10 @@ async def run_react_turn(
                     requires_approval=bool(tool.requires_approval),
                     status="running",
                 )
+                # 存档坐标：指针 W<n>.T<m> 靠这两列定位到这次调用
+                window_seq += 1
+                record.window_index = window_index
+                record.seq = window_seq
                 db.add(record)
                 await db.commit()
                 await db.refresh(record)
@@ -689,7 +1109,12 @@ async def run_react_turn(
                 elif tool.name in approved_tools:
                     started = time.perf_counter()
                     observation = await execute_tool(
-                        db, tool=tool, arguments=call.arguments, fallback_llm=llm
+                        db,
+                        tool=tool,
+                        arguments=call.arguments,
+                        fallback_llm=llm,
+                        session_id=session_id,
+                        run_id=run_id,
                     )
                     status = "ok" if observation.get("ok", True) else "error"
                     record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -761,7 +1186,12 @@ async def run_react_turn(
                         # 确认后正常执行（串行，用主会话）
                         started = time.perf_counter()
                         observation = await execute_tool(
-                            db, tool=tool, arguments=call.arguments, fallback_llm=llm
+                            db,
+                            tool=tool,
+                            arguments=call.arguments,
+                            fallback_llm=llm,
+                            session_id=session_id,
+                            run_id=run_id,
                         )
                         status = "ok" if observation.get("ok", True) else "error"
                         record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -769,7 +1199,12 @@ async def run_react_turn(
                 else:
                     started = time.perf_counter()
                     observation = await execute_tool(
-                        db, tool=tool, arguments=call.arguments, fallback_llm=llm
+                        db,
+                        tool=tool,
+                        arguments=call.arguments,
+                        fallback_llm=llm,
+                        session_id=session_id,
+                        run_id=run_id,
                     )
                     status = "ok" if observation.get("ok", True) else "error"
                     record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -800,6 +1235,21 @@ async def run_react_turn(
             steps.append(observation_step)
             await emit("step", observation_step.dump())
 
+            # 投影输入：观察摘要（带指针，方便笔记里引用"详情在 W2.T3"）
+            window_digest.append(
+                {
+                    "pointer": f"W{window_index}.T{window_seq}" if tool is not None else "",
+                    "kind": "tool",
+                    # ⚠️ 必须带工具名：只给摘要文本的话，模型分不清「W4.T2 到底是技术面还是 HR 面」，
+                    # 实测它会把两条搞混，然后在笔记里写错 refs.summary，后续窗口照着错笔记跑偏。
+                    "tool": call.name,
+                    # ⚠️ 必须给**真实输出**而不是给 UI 的预览：用 `summary`（前 200 字 + …）
+                    # 会让投影以为"内容被截断"，笔记里写死"截断版"，主模型于是反复回查 + 重跑工具。
+                    "text": digest_entry_text(observation),
+                    "round": round_index,
+                }
+            )
+
             # 回灌给模型：这是 ReAct 的"观察"环节，也是下一轮模型能看到的**新信息**。
             # `[:12000]` 防止一次大结果把上下文撑爆。
             payload_json = json.dumps(observation, ensure_ascii=False)[:12000]
@@ -815,7 +1265,9 @@ async def run_react_turn(
         # 本轮收尾：把"新增起点"更新为本轮开始前的长度。
         # 下一轮模型看到的"新增"就是本轮追加的 assistant + observation，
         # 而它们的起点恰恰是 round_baseline（只影响 Langfuse 上报）。
-        new_from = round_baseline
+        # 本轮换过页的话，上下文被重建成了 3 条（system / 笔记 / 续跑指令），
+        # 增量起点要从 3 开始，否则 Langfuse 上会把整个新窗口都当成"本轮新增"重发一遍。
+        new_from = 3 if rolled_this_round else round_baseline
 
         # 同步作业面到 checkpoint：刷新页面后前端靠 steps 重建时间线；
         # 若后面挂起等待确认，唤醒后后台任务也靠 messages 接着往下跑。
@@ -825,6 +1277,7 @@ async def run_react_turn(
             checkpoint.messages = messages
             checkpoint.steps = [step.dump() for step in steps]
             checkpoint.tool_call_ids = list(tool_call_ids)
+
     else:
         # for...else：只有循环**自然跑完**（没有 break）才执行，即 max_rounds 轮都没得出结论。
         # 给一句明确交代，而不是返回空让用户以为出错了。
@@ -852,4 +1305,8 @@ async def run_react_turn(
         steps=[step.dump() for step in steps],
         rounds=len(steps),
         tool_call_ids=tool_call_ids,
+        # 最终回答也要可寻址：占用窗口里的下一个 seq。
+        # sessions_router 拿这两个值给 assistant 消息盖坐标（否则 `W*.M*` 只覆盖用户消息）。
+        window_index=window_index,
+        seq=window_seq + 1,
     )

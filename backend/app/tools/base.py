@@ -36,6 +36,14 @@ class ToolContext:
     llm: LLMClient | None = None
     system: str = ""
     user: str = ""
+    #: 这次调用属于哪个会话。`recall` 这类"按存档指针取数"的工具必须有它 ——
+    #: 指针编号（W1.T2）只在会话内唯一，不按会话过滤会一次查出多个会话的行。
+    #: 测试场没有会话上下文，留空即可。
+    session_id: int | None = None
+    #: 这次调用属于哪个回合（run）。**存档指针的真正作用域是它，不是会话** ——
+    #: 每个回合的窗口号都从 W1 重新开始，同一个会话里第二回合的 `W1.T2`
+    #: 会和第一回合重名（实测：报 MultipleResultsFound）。
+    run_id: int | None = None
 
 
 Runner = Callable[[dict[str, Any], ToolContext], Awaitable[dict[str, Any]]]

@@ -7,11 +7,14 @@ FastAPI 在注册时无法解析成 Pydantic 模型，会退化成 query 参数�
 
 from __future__ import annotations
 
+from datetime import datetime
+from types import SimpleNamespace
+
 import httpx
 import pytest
 from fastapi.routing import APIRoute
 
-from app.api.v1.resource_router import SPEC_BY_SLUG, build_resource_router
+from app.api.v1.resource_router import SPEC_BY_SLUG, _to_out, build_resource_router
 from app.main import app
 
 SLUGS = sorted(SPEC_BY_SLUG)
@@ -64,3 +67,30 @@ async def test_impls_endpoint_returns_registered_impls() -> None:
     assert response.status_code == 200, response.text
     names = {item["impl_key"] for item in response.json()["impls"]}
     assert {"kb_search", "http_request", "pdf_extract"} <= names
+
+
+def test_model_out_carries_every_required_field() -> None:
+    """D48 给 `model_configs` 加了 `context_window`，但 `_to_out` 是**手工列字段**的。
+
+    漏传一个必填字段的后果不是"少一个值"，而是整条 `GET /models` 500 ——
+    模型配置页整页打不开，现象上像"页面没接后端"。这里用最小 ORM 替身锁住字段齐全。
+    """
+    now = datetime(2026, 9, 27, 12, 0, 0)
+    obj = SimpleNamespace(
+        id=1,
+        name="deepseek-chat",
+        description="",
+        base_url="https://api.deepseek.com",
+        api_key_cipher="",
+        model_name="deepseek-chat",
+        default_params={"temperature": 0.7},
+        timeout_s=120,
+        context_window=65536,
+        is_default=False,
+        is_enabled=True,
+        created_at=now,
+        updated_at=now,
+    )
+    out = _to_out(SPEC_BY_SLUG["models"], obj)
+    assert out.context_window == 65536  # type: ignore[attr-defined]
+    assert out.model_name == "deepseek-chat"  # type: ignore[attr-defined]

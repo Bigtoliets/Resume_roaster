@@ -88,7 +88,6 @@ async def complete_with_prompt(ctx: Any, *, role: str) -> dict[str, Any]:
     for attempt in range(retries + 1):
         try:
             text = (await ctx.llm.complete(messages)).strip()
-            break
         except (APITimeoutError, RateLimitError, APIError) as exc:
             if attempt >= retries:
                 logger.warning("工具 %s 调用模型失败（已重试）：%s", ctx.tool.name, exc)
@@ -104,10 +103,38 @@ async def complete_with_prompt(ctx: Any, *, role: str) -> dict[str, Any]:
                 RETRY_BACKOFF_S,
             )
             await asyncio.sleep(RETRY_BACKOFF_S * (attempt + 1))
+            continue
 
+        if text:
+            break
+
+        # 空输出同样要重试。实测踩过：`final_judge` 面对"简历 + JD + 两份面试报告"这种长输入时
+        # 直接返回空（reasoning 模型的思维链把输出预算吃光，或上游抖一下），
+        # 整个回合就断在最后一步、报告没产出。空输出大多是瞬时的，重试一次远比直接判失败划算。
+        logger.warning(
+            "工具 %s 第 %s 次调用返回空内容%s",
+            ctx.tool.name,
+            attempt + 1,
+            "，即将重试" if attempt < retries else "（重试后仍为空）",
+        )
+        if attempt < retries:
+            await asyncio.sleep(RETRY_BACKOFF_S * (attempt + 1))
+
+    # 摘要结尾必须标出总字数：只写"前 200 字 + …"的话，任何看图的人（包括模型）
+    # 都会以为工具只返回了 200 字、内容被截断了。实测把这句话误导进了笔记，
+    # 导致主模型重跑面试官工具去找"被截断的后半段"。
+    if not text:
+        summary = (
+            "模型没有返回内容（已重试）。常见原因：入参太长导致输出预算被思维链吃光，"
+            "或该模型不支持当前参数。可缩小入参，或换 max_tokens 更大的模型。"
+        )
+    elif len(text) > 200:
+        summary = f"{text[:200]}…（完整输出共 {len(text)} 字，已存入结果，需要时按指针回查）"
+    else:
+        summary = text
     return {
         "ok": bool(text),
-        "summary": (text[:200] + "…") if len(text) > 200 else (text or "模型没有返回内容"),
+        "summary": summary,
         "data": {"text": text, "role": role},
     }
 

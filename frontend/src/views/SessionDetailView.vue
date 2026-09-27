@@ -4,9 +4,10 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api, ApiError, streamTurn } from '@/api/client'
-import type { AttachmentRow, MessageRow, Report, SessionRow } from '@/api/types'
+import type { AttachmentRow, MessageRow, Report, RunNoteRow, SessionRow } from '@/api/types'
 import MarkdownBlock from '@/components/MarkdownBlock.vue'
 import ReportTextView from '@/components/report/ReportTextView.vue'
+import RunNoteCard from '@/components/RunNoteCard.vue'
 import StepsTimeline from '@/components/StepsTimeline.vue'
 import { confirmDialog } from '@/composables/useDialog'
 import { describeError } from '@/composables/useResource'
@@ -36,6 +37,8 @@ const session = computed(() => sessions.value.find((item) => item.id === session
 
 const messages = ref<MessageRow[]>([])
 const attachment = ref<AttachmentRow | null>(null)
+/** 任务笔记（D48）：上下文换页时后端写一条，这里渲染成「任务进度卡」。 */
+const notes = ref<RunNoteRow[]>([])
 const loading = ref(false)
 
 const agents = ref<{ id: number; name: string; tool_ids?: number[] }[]>([])
@@ -78,7 +81,13 @@ function stopTimer() {
 
 const sessionCache = new Map<
   number,
-  { at: number; messages: MessageRow[]; attachment: AttachmentRow | null; agentId: number | null }
+   {
+     at: number
+     messages: MessageRow[]
+     attachment: AttachmentRow | null
+     agentId: number | null
+     notes: RunNoteRow[]
+   }
 >()
 const CACHE_TTL = 60_000
 
@@ -143,17 +152,21 @@ async function loadMessages() {
     messages.value = cached.messages
     attachment.value = cached.attachment
     currentAgentId.value = cached.agentId
+     notes.value = cached.notes
     return
   }
   loading.value = true
   try {
-    const [msgs, attachments] = await Promise.all([
+     const [msgs, attachments, noteRows] = await Promise.all([
       api.get<MessageRow[]>(`/sessions/${target}/messages`),
       api.get<AttachmentRow[]>(`/sessions/${target}/attachments`).catch(() => []),
+       // 笔记接口可能还没上线（旧后端）——失败就走空列表，不影响对话本身
+       api.get<RunNoteRow[]>(`/sessions/${target}/notes`).catch(() => [] as RunNoteRow[]),
     ])
     if (sessionId.value !== target) return
     messages.value = msgs
     attachment.value = attachments[0] ?? null
+     notes.value = noteRows
     const row = sessions.value.find((item) => item.id === target)
     currentAgentId.value = row?.agent_id ?? null
     sessionCache.set(target, {
@@ -161,6 +174,7 @@ async function loadMessages() {
       messages: msgs,
       attachment: attachment.value,
       agentId: currentAgentId.value,
+       notes: noteRows,
     })
   } finally {
     if (sessionId.value === target) loading.value = false
@@ -179,6 +193,7 @@ async function openTarget(id?: number | null) {
     sessionId.value = null
     messages.value = []
     attachment.value = null
+     notes.value = []
     loading.value = false
     return
   }
@@ -198,6 +213,7 @@ async function newSession() {
   await router.replace(`/sessions/${created.id}`)
   messages.value = []
   attachment.value = null
+   notes.value = []
   input.value = ''
   await scrollToBottom()
 }
@@ -285,6 +301,9 @@ async function send() {
       role: 'user',
       type: 'text',
       content: { text: content },
+       // 本地乐观插入的占位消息：坐标要等后端落库后才有，先填 0
+       window_index: 0,
+       seq: 0,
       tokens: 0,
       latency_ms: 0,
       run_id: null,
@@ -300,7 +319,12 @@ async function send() {
       { content, agent_id: currentAgentId.value, attachment_id: attachment.value?.id ?? null },
       async (event, data) => {
         if (event === 'stage') {
-          liveStage.value = String(data.agent ? `${data.agent} 正在思考` : '正在思考')
+           // 换页事件（D48）：告诉用户"上下文满了、已经带着笔记开新窗口"，
+           // 否则长任务里会出现"它怎么突然不记得刚才的事了"的困惑
+           liveStage.value =
+             data.stage === 'rollover'
+               ? `上下文已换页（窗口 W${data.window_index ?? ''}），按任务笔记继续`
+               : String(data.agent ? `${data.agent} 正在思考` : '正在思考')
         } else if (event === 'step') {
           const incoming = data as unknown as Step
           // 确认卡片有两次推送：先是 approval_required（等待中，临时渲染），
@@ -375,16 +399,31 @@ async function send() {
 async function decideApproval(step: Step, approved: boolean, remember: boolean) {
   if (!step.tool_call_id) return
   step.status = 'sending'
+  // 后端一旦卡住（最典型的是 --reload 撞上挂起的 SSE，进程卡在
+  // "Waiting for connections to close"），这个 POST 会**永远不返回**，
+  // 卡片就停在"处理中…"，用户完全不知道发生了什么。
+  // 加个 15 秒超时，至少让他看到"后端可能在重启"。
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), 15_000)
   try {
-    await fetch(`/api/v1/tool-calls/${step.tool_call_id}/approve`, {
+    const response = await fetch(`/api/v1/tool-calls/${step.tool_call_id}/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ approved, remember }),
+      signal: controller.signal,
     })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const body = (await response.json()) as { waiting?: boolean }
+    if (body.waiting === false) {
+      // 后端已经没有在等这条了（超时、或后端重启过）——别假装确认成功
+      throw new Error('后端已不再等待这条确认（可能已超时或重启过），请重新发起这轮对话')
+    }
     step.status = approved ? 'approved' : 'cancelled'
   } catch (exc) {
     step.status = 'error'
     error.value = describeError(exc)
+  } finally {
+    window.clearTimeout(timer)
   }
   await scrollToBottom(true)
 }
@@ -508,9 +547,9 @@ onMounted(async () => {
                 {{ item.name }}（{{ (item.tool_ids || []).length }} 个工具）
               </option>
             </select>
-            <span v-if="session?.summary_upto_message_id" class="pill pill--ok">
-              会话摘要至 #{{ session.summary_upto_message_id }}
-            </span>
+             <span v-if="notes.length" class="pill pill--ok">
+               任务笔记 ×{{ notes.length }} · 窗口 W{{ notes[notes.length - 1].window_index }}
+             </span>
           </div>
         </div>
       </header>
@@ -522,6 +561,9 @@ onMounted(async () => {
         <p v-if="loading && visibleMessages.length" class="hint" style="text-align: center">
           正在加载会话…
         </p>
+
+         <!-- 当前任务状态（D48）：换页后模型唯一的依据，摊开给用户看 -->
+         <RunNoteCard v-if="notes.length" :notes="notes" />
 
         <div v-if="sessionId === null" class="chat-empty">
           <div class="seal" style="transform: rotate(-6deg)">诊</div>

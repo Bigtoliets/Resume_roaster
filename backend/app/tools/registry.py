@@ -218,6 +218,8 @@ async def execute_tool(
     tool: Tool,
     arguments: dict[str, Any] | None,
     fallback_llm: LLMClient | None = None,
+    session_id: int | None = None,
+    run_id: int | None = None,
 ) -> dict[str, Any]:
     """会话与测试场共用的唯一执行入口。任何失败都返回观察结果，不抛异常。
 
@@ -236,7 +238,14 @@ async def execute_tool(
             "arguments": arguments or {},
         },
     ) as span:
-        result = await _execute(db, tool=tool, arguments=arguments, fallback_llm=fallback_llm)
+        result = await _execute(
+            db,
+            tool=tool,
+            arguments=arguments,
+            fallback_llm=fallback_llm,
+            session_id=session_id,
+            run_id=run_id,
+        )
         if span is not None:
             with contextlib.suppress(Exception):
                 span.update(output=result)
@@ -249,6 +258,8 @@ async def _execute(
     tool: Tool,
     arguments: dict[str, Any] | None,
     fallback_llm: LLMClient | None = None,
+    session_id: int | None = None,
+    run_id: int | None = None,
 ) -> dict[str, Any]:
     spec = get_impl(tool.impl_key)
     if spec is None:
@@ -262,7 +273,7 @@ async def _execute(
     if args_error:
         return _fail(args_error, "bad_arguments")
     config = dict(tool.impl_config or {})
-    ctx = ToolContext(tool=tool, config=config, db=db)
+    ctx = ToolContext(tool=tool, config=config, db=db, session_id=session_id, run_id=run_id)
 
     if spec.needs_prompt:
         try:

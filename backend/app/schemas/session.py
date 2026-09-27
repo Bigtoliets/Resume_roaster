@@ -46,6 +46,10 @@ class MessageOut(BaseModel):
     role: str
     type: str
     content: dict[str, Any]
+    #: 存档坐标（D48）：笔记里的 `W2.M5` 指针就是靠这两列定位到这条消息。
+    #: 暴露出来是为了让前端/冒烟脚本能直接核对"指针是不是活指针"，而不是只能查库。
+    window_index: int = 0
+    seq: int = 0
     tokens: int
     latency_ms: int
     run_id: int | None

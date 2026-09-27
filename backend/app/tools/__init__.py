@@ -15,6 +15,7 @@ from app.tools import (  # noqa: F401
     interview_tech_lead,
     kb_search,
     pdf_extract,
+    recall,
 )
 from app.tools.base import ToolContext, ToolSpec
 from app.tools.registry import (

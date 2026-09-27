@@ -45,6 +45,7 @@ from app.db.models import (
     Message,
     ModelConfig,
     Run,
+    RunNote,
     Session,
     ToolCall,
 )
@@ -60,7 +61,7 @@ from app.schemas.session import (
     SessionOut,
     SessionUpdate,
 )
-from app.services.conversation import build_history, make_title, summarize_if_needed
+from app.services.conversation import build_history, make_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["会话"])
@@ -183,6 +184,42 @@ async def list_attachments(
         return [AttachmentOut.model_validate(row).model_dump(mode="json") for row in rows]
 
     return await cached(session_attachments_key(session_id), load)
+
+
+@router.get("/sessions/{session_id}/notes")
+async def list_run_notes(
+    session_id: int, limit: int = 20, db: AsyncSession = Depends(get_db)
+) -> list[dict[str, Any]]:
+    """会话的任务笔记（D48）：每次换页写一条，按时间正序返回最近 `limit` 条。
+
+    前端拿它渲染「任务进度卡」——**最后一条就是当前有效状态**
+    （goal / progress / decisions / plan / refs），前面几条作为换页历史可折叠回看。
+
+    没触发过换页时返回空数组（正常现象：上下文没满就不换页）。
+    """
+
+    async def load() -> list[dict[str, Any]]:
+        stmt = (
+            select(RunNote)
+            .where(RunNote.session_id == session_id)
+            .order_by(RunNote.id.desc())
+            .limit(max(1, min(limit, 100)))
+        )
+        rows = list((await db.execute(stmt)).scalars().all())
+        rows.reverse()  # 倒序取最近 N 条，翻正后给前端按时间正序渲染
+        return [
+            {
+                "id": row.id,
+                "run_id": row.run_id,
+                "window_index": row.window_index,
+                "source": row.source,
+                "content": row.content or {},
+                "created_at": row.created_at.isoformat() if row.created_at else "",
+            }
+            for row in rows
+        ]
+
+    return await cached(f"session:{session_id}:notes", load)
 
 
 @router.post("/sessions/{session_id}/attachments", response_model=AttachmentOut, status_code=201)
@@ -351,17 +388,21 @@ async def _turn_stream(
                     return
 
                 text = (payload.content or "").strip()
+                #: 本轮用户消息的主键。传给主循环去盖存档坐标（`W1.M1`），
+                #: 没它的话笔记里引用的消息级指针永远查不到行。
+                user_message_id: int | None = None
                 if text:
-                    db.add(
-                        Message(
-                            session_id=session_id,
-                            role="user",
-                            type="text",
-                            content={"text": text},
-                            run_id=run_id,
-                        )
+                    user_message = Message(
+                        session_id=session_id,
+                        role="user",
+                        type="text",
+                        content={"text": text},
+                        run_id=run_id,
                     )
+                    db.add(user_message)
                     await db.commit()
+                    await db.refresh(user_message)
+                    user_message_id = user_message.id
                     invalidate_session(session_id)
 
                 history = await build_history(db, session_id, 8)
@@ -421,9 +462,9 @@ async def _turn_stream(
                             agent=agent,
                             user_content=text,
                             history=history,
-                            summary=session.summary or "",
                             attachments=attachments,
                             emit=emit,
+                            user_message_id=user_message_id,
                         )
                         if agent_span is not None:
                             with contextlib.suppress(Exception):
@@ -445,6 +486,9 @@ async def _turn_stream(
                     run_id=run_id,
                     latency_ms=elapsed,
                     langfuse_trace_id=trace_id,
+                    # D48 存档坐标：让这条回答也能被 `W*.M*` 指针回查
+                    window_index=result.window_index,
+                    seq=result.seq,
                 )
                 db.add(assistant)
                 run_row = await db.get(Run, run_id)
@@ -473,9 +517,6 @@ async def _turn_stream(
                     },
                 )
 
-                summary = await summarize_if_needed(db, session, None)
-                if summary:
-                    await emit("summary", {"summary": summary})
                 await emit("done", {"run_id": run_id, "elapsed_ms": elapsed})
             except Exception as exc:  # noqa: BLE001
                 logger.exception("ReAct 回合失败")

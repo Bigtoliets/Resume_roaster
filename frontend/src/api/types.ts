@@ -28,6 +28,9 @@ export interface MessageRow {
   role: string
   type: 'text' | 'file' | 'progress' | 'report' | 'debate_trace'
   content: Record<string, any>
+  /** 存档坐标（D48）：笔记里的 `W2.M5` 指针靠它定位，0 表示这条不可回查 */
+  window_index: number
+  seq: number
   tokens: number
   latency_ms: number
   run_id: number | null
@@ -41,6 +44,29 @@ export interface AttachmentRow {
   filename: string
   size: number
   sha256: string
+  created_at: string
+}
+
+/** 任务笔记（D48）：窗口换页时物化出的任务状态，是跨窗口唯一的连续性来源。 */
+export interface RunNoteProgress {
+  /** 已完成的步骤列表，每完成一步追加一条（旧笔记里这可能是字符串或 {done,missing}） */
+  stage?: string | string[]
+}
+
+export interface RunNoteContent {
+  goal?: string
+  /** 新结构是对象；旧笔记存的是纯文本，前端两种都要能显示 */
+  progress?: string | RunNoteProgress
+  plan?: string[]
+  refs?: { pointer?: string; summary?: string; kind?: string }[]
+}
+
+export interface RunNoteRow {
+  id: number
+  run_id: number
+  window_index: number
+  source: string
+  content: RunNoteContent
   created_at: string
 }
 

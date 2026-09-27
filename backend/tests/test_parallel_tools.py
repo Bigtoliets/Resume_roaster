@@ -29,7 +29,11 @@ class FakeSession:
 
 @pytest.fixture
 def fake_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_execute(db, *, tool, arguments, fallback_llm=None):  # noqa: ANN001
+    # 签名要和真实的 execute_tool 一致（含 session_id / run_id），
+    # 否则主循环多传一个参数就 TypeError
+    async def fake_execute(  # noqa: ANN001
+        db, *, tool, arguments, fallback_llm=None, session_id=None, run_id=None
+    ):
         await asyncio.sleep(0.2)
         return {"ok": True, "summary": f"{tool.name} 完成"}
 

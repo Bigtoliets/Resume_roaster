@@ -44,6 +44,7 @@ def fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
             langfuse_public_key="pk-test",
             langfuse_secret_key="sk-test",
             langfuse_url="http://langfuse.test",
+            langfuse_public_url="http://langfuse.test",
         ),
     )
     monkeypatch.setattr("langfuse.Langfuse", FakeLangfuse)
@@ -74,3 +75,30 @@ def test_warming_period_suppresses_repeated_attempts(fresh_state: None, monkeypa
     assert obs.get_client() is None
     assert obs.get_client() is None
     assert FakeLangfuse.attempts == 1, "冷却期内不应重复尝试初始化"
+
+
+def test_client_status_exposes_failure_reason(fresh_state: None) -> None:
+    """体检接口必须**真去看客户端**，只报"已配置"会在 SDK 缺失时骗人。
+
+    实测事故：换了个没装 langfuse 的 Python 环境跑后端，整条链路在 Langfuse 上
+    凭空消失，而 `/system/status` 一直显示 configured=true，白查半天。
+    """
+    broken = obs.client_status()
+    assert broken["configured"] is True
+    assert broken["ok"] is False, "初始化失败时 ok 必须是 False"
+    assert "模拟首次连接失败" in broken["error"], "要把真实原因带出来"
+
+    obs._retry_after = 0.0  # 过了冷却，第二次会成功
+    healthy = obs.client_status()
+    assert healthy["ok"] is True
+    assert healthy["error"] == ""
+
+
+def test_client_status_reports_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        obs, "settings", SimpleNamespace(langfuse_enabled=False, langfuse_public_url="")
+    )
+    state = obs.client_status()
+    assert state["configured"] is False
+    assert state["ok"] is False
+    assert "LANGFUSE" in state["error"]

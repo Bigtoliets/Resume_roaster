@@ -37,6 +37,7 @@ const {
   skill_ids: [],
   tool_ids: [],
   max_rounds: 12,
+  context_threshold_pct: 80,
   parallel_tools: true,
   params_override: {},
   is_enabled: true,
@@ -109,6 +110,18 @@ onMounted(load)
           <input type="number" v-model.number="draft.max_rounds" min="1" max="30" />
         </FormRow>
         <FormRow
+          label="上下文换页阈值（%）"
+          hint="累计 token 超过「模型上下文窗口 × 这个比例」时整段换页，任务状态交给笔记延续。10–95，推荐 80"
+        >
+          <input
+            type="number"
+            v-model.number="draft.context_threshold_pct"
+            min="10"
+            max="95"
+            step="5"
+          />
+        </FormRow>
+        <FormRow
           label="同轮工具并发"
           hint="模型一轮里同时调多个工具时并发执行（比如技术面试官 + HR 面试官），能省掉一半等待"
         >
@@ -163,6 +176,9 @@ onMounted(load)
             <div>Skills：{{ names('skills', draft.skill_ids) }}</div>
             <div>可用工具（{{ (draft.tool_ids || []).length }} 个）：{{ names('tools', draft.tool_ids) }}</div>
             <div>最大轮次：{{ draft.max_rounds }}</div>
+            <div>
+              换页阈值：上下文窗口的 {{ draft.context_threshold_pct ?? 80 }}%（窗口大小在模型配置页设置）
+            </div>
           </div>
           <p class="hint" style="margin-top: 8px">
             可选 Skill {{ skills.items.length }} 个 · 可选工具 {{ tools.items.length }} 个

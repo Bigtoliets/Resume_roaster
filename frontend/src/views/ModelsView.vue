@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive } from 'vue'
+import { computed, onMounted, reactive } from 'vue'
 
 import { api } from '@/api/client'
 import FormRow from '@/components/form/FormRow.vue'
@@ -33,11 +33,28 @@ const {
   model_name: 'deepseek-chat',
   default_params: { temperature: 0.7, max_tokens: 4096 },
   timeout_s: 120,
+  context_window: 65536,
   is_default: false,
   is_enabled: true,
 }))
 
 const test = reactive({ busy: false, output: '', ok: null as boolean | null })
+
+/**
+ * `max_tokens` 在库里属于 `default_params` 这个 JSON，但它是最常改的一项，
+ * 藏在 JSON 里每次都要手写键名。这里做成表单字段：读时从 JSON 取，写时合回去，
+ * 其余参数（temperature 等）仍然走下面的 JSON 编辑框。
+ */
+const maxTokens = computed({
+  get: () => Number((draft.value.default_params as Record<string, unknown>)?.max_tokens ?? 4096),
+  set: (value: number) => {
+    const next = { ...((draft.value.default_params as Record<string, unknown>) || {}) }
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed > 0) next.max_tokens = Math.trunc(parsed)
+    else delete next.max_tokens
+    draft.value.default_params = next
+  },
+})
 
 async function saveModel() {
   // API Key 只在填了的时候提交：留空 = 保持原密钥不变
@@ -106,10 +123,22 @@ onMounted(load)
       <FormRow label="超时（秒）" hint="辩论类节点建议 120，推理类建议 240">
         <input type="number" v-model.number="draft.timeout_s" />
       </FormRow>
+      <FormRow
+        label="最大输出 Token"
+        hint="单次回复的长度上限（max_tokens），写进默认参数 JSON"
+      >
+        <input type="number" v-model.number="maxTokens" min="1" step="256" />
+      </FormRow>
+      <FormRow
+        label="上下文窗口"
+        hint="模型能吃下的最大 token 数，Agent 的换页阈值按它算比例；Ollama 类模型可查 model card"
+      >
+        <input type="number" v-model.number="draft.context_window" min="1024" step="1024" />
+      </FormRow>
       <FormRow label="描述">
         <input v-model="draft.description" placeholder="这套配置准备给谁用" />
       </FormRow>
-      <FormRow label="默认参数" hint="直接透传给模型的参数，如 temperature / max_tokens">
+      <FormRow label="默认参数" hint="其余直接透传给模型的参数，如 temperature / top_p（max_tokens 已提到上面）">
         <JsonField v-model="draft.default_params" :rows="6" />
       </FormRow>
       <FormRow label="开关">

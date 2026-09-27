@@ -21,6 +21,9 @@ _client: Any | None = None
 _initialized = False
 _retry_after = 0.0
 
+#: 最近一次初始化失败的原因，供体检接口展示（成功时清空）。
+_last_error = ""
+
 #: 初始化失败后的冷却秒数：冷却期内静默降级，过后自动重试。
 #: **不能永久降级** —— 之前把"失败"也写进 _initialized，一次网络抖动
 #: （或换了 key 没重启）就会让整个进程生命周期内再也不产生 trace。
@@ -29,7 +32,7 @@ FAILURE_COOLDOWN_S = 60.0
 
 def get_client() -> Any | None:
     """懒加载单例。未配置返回 None；初始化失败进入冷却，冷却结束会自动重试。"""
-    global _client, _initialized, _retry_after
+    global _client, _initialized, _retry_after, _last_error
     if _client is not None:
         return _client
     if not settings.langfuse_enabled:
@@ -51,14 +54,42 @@ def get_client() -> Any | None:
             raise RuntimeError(f"探活失败（{settings.langfuse_url}）")
         _client = client
         _retry_after = 0.0
+        _last_error = ""
         logger.info("Langfuse 已接入：%s", settings.langfuse_url)
     except Exception as exc:  # noqa: BLE001
         _client = None
         _retry_after = time.monotonic() + FAILURE_COOLDOWN_S
+        _last_error = f"{type(exc).__name__}: {exc}"
         logger.warning(
             "Langfuse 初始化失败，已降级（%.0fs 后自动重试）：%s", FAILURE_COOLDOWN_S, exc
         )
     return _client
+
+
+def client_status() -> dict[str, Any]:
+    """体检用：**真去拿一次客户端**，而不是只读配置开关。
+
+    只报 `configured` 会骗人 —— 依赖没装（`No module named 'langfuse'`）、
+    服务不可达、key 不对，这三种都会让观测**静默关闭**，而 `configured` 依旧是真。
+    实测就踩过：换了个没装 SDK 的 Python 环境跑，整条链路在 Langfuse 上凭空消失，
+    而 `/system/status` 一直说配置正常，查了半天才发现是环境问题。
+
+    `get_client()` 自带 60s 失败冷却，所以这里不会被体检请求打爆。
+    """
+    if not settings.langfuse_enabled:
+        return {
+            "configured": False,
+            "ok": False,
+            "error": "未配置 LANGFUSE_PUBLIC_KEY / SECRET_KEY / BASE_URL",
+            "url": "",
+        }
+    client = get_client()
+    return {
+        "configured": True,
+        "ok": client is not None,
+        "error": "" if client is not None else (_last_error or "初始化失败（详见后端日志）"),
+        "url": settings.langfuse_public_url,
+    }
 
 
 @contextmanager

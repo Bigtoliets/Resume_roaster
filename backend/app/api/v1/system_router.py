@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db
 from app.core.config import settings
 from app.db.models import Agent, KnowledgeBase, ModelConfig, Prompt, Skill, Tool
+from app.obs.langfuse import client_status as langfuse_client_status
 from app.tools.registry import list_impls
 
 router = APIRouter(tags=["系统"])
@@ -32,7 +33,8 @@ async def system_status(db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
     status: dict[str, Any] = {
         "mysql": {"configured": settings.mysql_configured, "ok": False, "error": ""},
         "milvus": {"configured": settings.milvus_configured, "ok": False, "version": "", "error": ""},
-        "langfuse": {"configured": settings.langfuse_enabled, "url": settings.langfuse_public_url},
+        # 真去拿一次客户端：只报 configured 会在"SDK 没装 / 服务不可达"时骗人
+        "langfuse": langfuse_client_status(),
         "embedding": {
             "provider": settings.embedding_provider,
             "model": settings.embedding_model,

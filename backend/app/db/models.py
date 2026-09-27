@@ -33,6 +33,8 @@ class ModelConfig(Base, TimestampMixin):
     model_name: Mapped[str] = mapped_column(String(128), default="")
     default_params: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     timeout_s: Mapped[int] = mapped_column(Integer, default=120)
+    #: 模型的最大上下文窗口（token）。窗口换页的阈值按它算比例（D48）。
+    context_window: Mapped[int] = mapped_column(Integer, default=65536)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -99,6 +101,30 @@ class ToolCall(Base):
     requires_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     approved: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     elapsed_ms: Mapped[int] = mapped_column(Integer, default=0)
+    #: 存档坐标，语义同 Message：指针 W2.T3 靠这两列定位。
+    window_index: Mapped[int] = mapped_column(Integer, default=0)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RunNote(Base):
+    """任务笔记（D48）：换页时物化出的任务状态，是跨窗口唯一的连续性来源。
+
+    每换一次页写一条；`window_index` 记录"这是换完第几次页之后的笔记"，
+    取最新一条即当前有效状态。只读语义：历史行不再修改。
+    """
+
+    __tablename__ = "run_notes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    session_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    #: 写这份笔记时的窗口号
+    window_index: Mapped[int] = mapped_column(Integer, default=1)
+    #: 笔记正文：goal / progress / decisions / plan / refs
+    content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    #: 生成方式：projection（正常换页投影）/ recovery（回校修正）
+    source: Mapped[str] = mapped_column(String(16), default="projection")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -153,6 +179,8 @@ class Agent(Base, TimestampMixin):
     skill_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     tool_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
     max_rounds: Mapped[int] = mapped_column(Integer, default=12)
+    #: 上下文用量超过 context_window 的这个百分比就换页（D48）。80 = 到 80% 触发。
+    context_threshold_pct: Mapped[int] = mapped_column(Integer, default=80)
     #: 同一轮里模型一次调多个工具时，是否并发执行（默认开）
     parallel_tools: Mapped[bool] = mapped_column(Boolean, default=True)
     params_override: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -202,6 +230,11 @@ class Message(Base, TimestampMixin):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     langfuse_trace_id: Mapped[str] = mapped_column(String(64), default="")
+    #: 存档坐标（D48）：属于第几个上下文窗口、窗口内第几条。
+    #: 消息与工具调用共用一个 seq 计数器，所以指针 W2.M5 / W2.T3 唯一。
+    #: 0 表示不属于任何窗口（历史数据）。
+    window_index: Mapped[int] = mapped_column(Integer, default=0)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Attachment(Base, TimestampMixin):

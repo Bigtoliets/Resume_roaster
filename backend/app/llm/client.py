@@ -42,6 +42,11 @@ class ChatStepResult:
     content: str = ""
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = ""
+    #: 这一轮真实喂进去的 prompt token 数（服务端算的，不是估算）。
+    #: 长上下文治理的换页判断就靠它（见 app/agent/notes.py 与 loop 的换页逻辑）。
+    prompt_tokens: int = 0
+    #: 输出 token 数，用于算"上一轮的增量"，从而预测下一轮会不会顶到窗口上限。
+    completion_tokens: int = 0
 
 
 class LLMClient:
@@ -64,7 +69,19 @@ class LLMClient:
 
     # ---------- 基础调用 ----------
 
-    async def complete(self, messages: list[dict[str, str]], *, json_mode: bool = False) -> str:
+    async def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool = False,
+        name: str = "llm-call",
+    ) -> str:
+        """非流式调用。
+
+        `name` 只是 Langfuse 里那条 generation 的名字。默认 `llm-call` 是"主循环之外
+        的辅助调用"，真正有语义的调用方（比如笔记投影）会传自己的名字，
+        这样 trace 上一眼能分出"哪次是模型在思考、哪次是系统在做记忆换页"。
+        """
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -72,7 +89,7 @@ class LLMClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        with _generation("llm-call", model=self.model, input_value=messages) as generation:
+        with _generation(name, model=self.model, input_value=messages) as generation:
             try:
                 resp = await self._client.chat.completions.create(**payload)
             except (APITimeoutError, RateLimitError, APIError) as exc:
@@ -186,6 +203,10 @@ class LLMClient:
                 content="".join(content_parts).strip(),
                 tool_calls=requests,
                 finish_reason=finish_reason,
+                # 带上真实用量：换页判断要用 prompt_tokens，
+                # "上一轮增量"用 prompt + completion 之和来外推。
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
             )
             if generation is not None:
                 with contextlib.suppress(Exception):
@@ -207,12 +228,18 @@ class LLMClient:
 
     # ---------- 结构化输出 ----------
 
-    async def complete_json(self, messages: list[dict[str, str]], schema: type[TModel]) -> TModel:
+    async def complete_json(
+        self,
+        messages: list[dict[str, str]],
+        schema: type[TModel],
+        *,
+        name: str = "llm-call",
+    ) -> TModel:
         """要求模型输出 JSON 并强校验；失败则追加一句重试一次。"""
         attempt_messages = list(messages)
         last_error: Exception | None = None
         for attempt in range(2):
-            raw = await self.complete(attempt_messages, json_mode=True)
+            raw = await self.complete(attempt_messages, json_mode=True, name=name)
             try:
                 return schema.model_validate(_loads_lenient(raw))
             except (ValidationError, ValueError) as exc:

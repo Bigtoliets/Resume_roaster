@@ -82,6 +82,9 @@ def _to_out(spec: ResourceSpec, obj: Any) -> BaseModel:
             model_name=obj.model_name,
             default_params=obj.default_params or {},
             timeout_s=obj.timeout_s,
+             # D48 新增列：出参 schema 里是必填，不显式传就会 ValidationError
+             # （表现为整个 GET /models 500，模型页直接打不开）
+             context_window=obj.context_window or 65536,
             is_default=obj.is_default,
             is_enabled=obj.is_enabled,
             created_at=obj.created_at,
