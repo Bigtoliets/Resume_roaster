@@ -411,6 +411,8 @@ class TurnResult:
 #                                assistant(最终文本)
 #                                     ↓ 回合结束
 # 【落库】messages 表：本轮 user + 本轮 assistant（text + steps，工具结果只留摘要）
+
+#todo ： 核心链路 run_react_turn
 async def run_react_turn(
     db: AsyncSession,
     *,
