@@ -20,7 +20,18 @@ interface Step {
   timeout_s?: number
 }
 
-const props = defineProps<{ steps: Step[]; defaultOpen?: boolean; streaming?: boolean }>()
+const props = defineProps<{
+  steps: Step[]
+  defaultOpen?: boolean
+  streaming?: boolean
+  /**
+   * 没有工具调用时显示的一句话状态。
+   *
+   * 传了它 = 这一轮也要出现链路卡片（页面只保留这一种展示形态：💭思考 → 🔧行动 → 👁观察）。
+   * 不传 = 没有步骤就整块隐藏（流式等待中用的是另一套"三个跳动的点"，不需要这张卡）。
+   */
+  emptyText?: string
+}>()
 const emit = defineEmits<{ decide: [step: Step, approved: boolean, remember: boolean] }>()
 
 /** "本回合不再问"是按**每个卡片**单独勾的，所以状态存在这里（tool_call_id → 是否勾选）。 */
@@ -34,6 +45,10 @@ const counts = computed(() => ({
   thought: props.steps.filter((s) => s.type === 'thought').length,
   action: props.steps.filter((s) => s.type === 'action').length,
 }))
+
+/** 有步骤才谈得上"折叠 / 展开"；没有步骤时这张卡只是一句状态说明。 */
+const hasSteps = computed(() => props.steps.length > 0)
+const visible = computed(() => hasSteps.value || Boolean(props.emptyText))
 
 async function toggleDetail(step: Step) {
   if (!step.tool_call_id) return
@@ -63,8 +78,8 @@ function argsPreview(step: Step): string {
 </script>
 
 <template>
-  <div v-if="steps.length" class="steps">
-    <button class="steps__head" type="button" @click="open = !open">
+  <div v-if="visible" class="steps">
+    <button v-if="hasSteps" class="steps__head" type="button" @click="open = !open">
       <span class="steps__badge">💭</span>
       <span class="steps__title">
         思考与行动 · {{ counts.thought }} 次思考 / {{ counts.action }} 次工具调用
@@ -73,8 +88,14 @@ function argsPreview(step: Step): string {
       <span class="spacer" />
       <span class="mono" style="color: var(--ink-3)">{{ open ? '收起 ▲' : '展开 ▼' }}</span>
     </button>
+    <!-- 没有工具调用的一轮：同样用这张卡，只给一句状态；不做成可折叠的空面板 -->
+    <div v-else class="steps__head steps__head--static">
+      <span class="steps__badge">💭</span>
+      <span class="steps__title">思考与行动 · {{ emptyText }}</span>
+      <span v-if="streaming" class="pill pill--seal">进行中</span>
+    </div>
 
-    <div v-if="open" class="steps__body">
+    <div v-if="hasSteps && open" class="steps__body">
       <div
         v-for="(step, index) in steps"
         :key="index"
@@ -219,6 +240,15 @@ function argsPreview(step: Step): string {
 
 .steps__head:hover {
   background: rgba(25, 23, 18, 0.03);
+}
+
+/* 没有步骤时的静态头：不可点、不响应悬停 */
+.steps__head--static {
+  cursor: default;
+}
+
+.steps__head--static:hover {
+  background: transparent;
 }
 
 .steps__badge {

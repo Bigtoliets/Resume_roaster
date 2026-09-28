@@ -94,8 +94,23 @@ logger = logging.getLogger(__name__)
 
 EmitFn = Callable[[str, dict[str, Any]], Awaitable[None]]
 
-#: 文本协议里的 Action 标记：`Action: {...}` / `Action：{...}`
-_ACTION_RE = re.compile(r"Action\s*[:：]\s*(\{)", re.S)
+#: 文本协议里的 Action 标记。模型实测会写成 `Action: {...}`、`**Action**：{...}`，
+#: 也会把 JSON 单独包进代码围栏：
+#:     **Action**：
+#:     ```json
+#:     {"tool": "...", "input": {...}}
+#:     ```
+#: 只认"冒号后面紧挨着花括号"那一种会漏解析——而漏解析的代价不是"少调一次工具"，
+#: 是**这一轮直接被当成最终回答**：整段裸协议连同 JSON 一起进了答案气泡（实测踩过）。
+_ACTION_RE = re.compile(r"\*{0,2}Action\*{0,2}\s*[:：]", re.S)
+
+#: Action 冒号与 JSON 之间允许出现的装饰：空白、代码围栏反引号、`json` 语言标注。
+_ACTION_DECOR_RE = re.compile(r"[\s`]*(?:json)?[\s`]*", re.I)
+
+#: 开头的 `Thought:` / `思考：` 标签（允许被代码围栏或加粗包裹）。
+_THOUGHT_LABEL_RE = re.compile(
+    r"^[\s`]*(?:json)?[\s`]*\*{0,2}(?:Thought|思考)\*{0,2}\s*[:：]\s*", re.I
+)
 
 #: 换页后注入的续跑指令。三句话都在防同一件事：模型看到干净上下文时，
 #: 会把笔记里描述的"已完成步骤"当成"还没做"，于是从头再查一遍。
@@ -229,6 +244,9 @@ def parse_text_action(text: str) -> tuple[str, dict[str, Any]] | None:
     文本协议是给不支持 function calling 的模型用的（提示词里明确要求模型输出
     Thought/Action）。运行时解析出 Action 后，走和执行原生 tool_calls 完全一样的执行器，
     再把结果以 `Observation:` 回灌。解析不出来返回 None，由调用方按普通回答处理。
+
+    容忍写法差异（见 `_ACTION_RE`）：`**Action**`、全角冒号、以及把 JSON 单独包进
+    ```json 围栏。只认最规矩那一种的代价太大——漏解析会让整轮变成"最终回答"。
     """
     if not text:
 
@@ -236,7 +254,11 @@ def parse_text_action(text: str) -> tuple[str, dict[str, Any]] | None:
     match = _ACTION_RE.search(text)
     if match is None:
         return None
-    raw = _extract_json_object(text, match.start(1))
+    # 跳到 JSON 的左花括号：中间只允许空白 / 反引号 / `json` 语言标注这类装饰
+    start = _ACTION_DECOR_RE.match(text, match.end()).end()
+    if start >= len(text) or text[start] != "{":
+        return None
+    raw = _extract_json_object(text, start)
     if not raw:
         return None
     try:
@@ -251,6 +273,38 @@ def parse_text_action(text: str) -> tuple[str, dict[str, Any]] | None:
         return None
     arguments = data.get("input")
     return tool, arguments if isinstance(arguments, dict) else {}
+
+
+def strip_protocol_scaffolding(text: str) -> str:
+    """剥掉文本协议的脚手架，只留下人看的正文。
+
+    文本协议下 `result.content` 是模型的原样输出，长这样：
+
+        Thought: 先读简历正文。
+        Action: {"tool": "pdf_extract", "input": {...}}
+
+    这段文本有两个去处必须是干净的：前端「思考」卡片、以及模型没给出工具调用时
+    兜底成的那条最终回答。不剥的话用户看到的就是裸协议 + 一段 JSON——而按约定
+    这个页面只展示一种形态：💭思考 → 🔧行动 → 👁观察 的链路。
+
+    只做减法，不重排：没有 Action、也没有 Thought 标签时原样返回。
+    """
+    if not text:
+        return ""
+    body = text
+    # 1) Action 连同它后面的 JSON 一起砍掉（围栏、换行都在它后面）
+    match = _ACTION_RE.search(body)
+    if match is not None:
+        body = body[: match.start()]
+    # 2) 去掉开头的 `Thought:` / `**Thought**：` / `思考：` 标签
+    body = _THOUGHT_LABEL_RE.sub("", body)
+    # 3) 清掉可能残留的代码围栏与首尾空白
+    body = body.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    if body.endswith("```"):
+        body = body[:-3]
+    return body.strip().strip("`").strip()
 
 
 @dataclass
@@ -728,9 +782,18 @@ async def run_react_turn(
                 tool_name, tool_args = parsed
                 if tool_name == "finish":
                     # 文本协议约定 `{"tool":"finish","input":{"answer":"..."}}` = 我收尾了。
-                    # 取 answer 当最终回答；模型偶尔忘写 answer，就退回整段文本。
+                    # 取 answer 当最终回答；模型偶尔忘写 answer，就退回整段文本
+                    # （退回时也要先剥脚手架，否则回答里会带着 `Thought:` 和 Action JSON）。
                     answer = str(tool_args.get("answer") or "").strip()
-                    final_text = answer or result.content
+                    final_thought = strip_protocol_scaffolding(result.content)
+                    final_text = answer or final_thought
+                    # 收尾这一轮也要留痕：模型的最后一句"思考"就在 result.content 里，
+                    # 而这里 break 得比下面的步骤记录块早——不补这一条，链路会缺最后一环，
+                    # 看起来像"没思考就下了结论"。只在它是独立正文（≠回答）时补，避免复读答案。
+                    if final_thought and final_thought != final_text:
+                        thought = Step(type="thought", text=final_thought[:600])
+                        steps.append(thought)
+                        await emit("step", thought.dump())
                     break
                 # 关键一步：把解析出的 Action 包装成和原生一样的 ToolCallRequest，
                 # 这样下面的执行、落库、回灌全部复用同一条路径，不用写两套逻辑。
@@ -748,7 +811,14 @@ async def run_react_turn(
         # 两种协议都没给出工具调用 → 模型这轮就是在回答，整段文本即最终答案。
         # 兜底文案防"模型返回空"的极端情况，避免前端显示空白。
         if not result.tool_calls:
-            final_text = result.content or "（模型没有返回内容）"
+            # 先剥协议脚手架：模型偶尔会把 Action 写坏（JSON 不合法）导致上面的解析失败，
+            # 那时 result.content 里还留着 `Thought: … Action: {...}` 整段原文，直接当回答
+            # 就会让答案气泡里出现裸协议（页面只展示思考/行动/观察链路）。
+            final_text = (
+                strip_protocol_scaffolding(result.content)
+                or result.content
+                or "（模型没有返回内容）"
+            )
             break
 
         # 低效触发的依据：本轮调了哪些工具、参数是什么。
@@ -821,7 +891,8 @@ async def run_react_turn(
 
         rolled_this_round = False
         if triggers:
-            latest_thought = result.content or latest_thought
+            # 笔记的 plan 取自"最后一次 think"，同样要剥脚手架
+            latest_thought = strip_protocol_scaffolding(result.content) or latest_thought
             with trace_span(
                 "memory-rollover",
                 as_type="span",
@@ -953,20 +1024,23 @@ async def run_react_turn(
 
         # 模型可能先嘀咕几句再决定调工具。这段嘀咕作为一条"思考"落库 + 推送。
         # `[:600]` 是防止它长篇大论把消息表撑爆（完整内容不需要留）。
-        if result.content:
-            thought = Step(type="thought", text=result.content[:600])
+        # 文本协议下 result.content 还带着 `Thought:` 标签和整段 `Action: {...}`，
+        # 这里先剥掉，落库/推送的才是"思考正文"（否则思考卡片里显示的是裸协议 + JSON）。
+        thought_text = strip_protocol_scaffolding(result.content)
+        if thought_text:
+            thought = Step(type="thought", text=thought_text[:600])
             steps.append(thought)
             await emit("step", thought.dump())
             # 这一段就是"act 之前的 think"：模型刚说完要做什么，紧接着才调工具。
             # 笔记的 plan 要的就是它。
-            latest_thought = result.content
+            latest_thought = thought_text
             # 投影输入：思考流水（不带指针——它只体现"模型当时的判断"，不需要回查原文）
             # 带上轮次：投影时 `decisions[].round` 就靠它，不写模型只能瞎猜。
             window_digest.append(
                 {
                     "pointer": "",
                     "kind": "thought",
-                    "text": result.content[:300],
+                    "text": thought_text[:300],
                     "round": round_index,
                 }
             )

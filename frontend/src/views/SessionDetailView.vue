@@ -613,7 +613,8 @@ onMounted(async () => {
               <div class="row" style="gap: 8px; margin-bottom: 6px">
                 <span class="eyebrow">{{ agentNameOf(message) || '助手' }}</span>
               </div>
-              <StepsTimeline v-if="stepsOf(message).length" :steps="stepsOf(message)" />
+              <!-- 页面只保留这一种展示形态：不管这一轮有没有调工具，都先出现链路卡片 -->
+              <StepsTimeline :steps="stepsOf(message)" empty-text="本轮未调用工具，直接作答" />
               <div class="bubble bubble--ai bubble--md">
                 <MarkdownBlock :text="textOf(message)" :cache-key="message.id" />
               </div>
