@@ -271,15 +271,18 @@ def test_render_short_entry_has_no_excerpt_marker() -> None:
 def test_projection_prompt_forbids_claiming_truncation() -> None:
     from app.agent.notes import PROJECTION_SYSTEM
 
-    assert "不代表工具输出被截断" in PROJECTION_SYSTEM
-    assert "截断版" in PROJECTION_SYSTEM  # 作为反例被明确点名
+    # 提示词改写过几次，断言跟着对齐当前措辞 —— 这条守卫的不变量始终是同一个：
+    # 投影**不许**把存档里的正常内容当成"被截断/不全"，否则主模型会照着去反复回查。
+    assert "严禁误判结果截断" in PROJECTION_SYSTEM
+    assert "禁止写「截断」" in PROJECTION_SYSTEM
 
 
 def test_projection_prompt_forbids_pointing_refs_at_recall() -> None:
     """refs 指向 recall 的结果 = 让下个窗口"回查一次回查"，内容重复且更长。"""
     from app.agent.notes import PROJECTION_SYSTEM
 
-    assert "不要指向 `recall`" in PROJECTION_SYSTEM
+    assert "严禁 refs 指向 recall" in PROJECTION_SYSTEM
+    assert "禁止指向 recall 的返回结果" in PROJECTION_SYSTEM
 
 
 async def test_project_notes_names_its_generation() -> None:

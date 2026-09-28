@@ -108,10 +108,14 @@ class ToolCall(Base):
 
 
 class RunNote(Base):
-    """任务笔记（D48）：换页时物化出的任务状态，是跨窗口唯一的连续性来源。
+    """任务笔记（D48 / D63）：跨窗口、跨回合唯一的连续性来源。
 
-    每换一次页写一条；`window_index` 记录"这是换完第几次页之后的笔记"，
-    取最新一条即当前有效状态。只读语义：历史行不再修改。
+    写它的时机有两个（D60）：**换页时**、**回合收尾时**。
+
+    **D63 起是就地覆盖**：一个会话只保留一行，每次投影改同一行（`upsert_notes()`）。
+    改造前是"每换一次页追加一条、老的不动"的多版本表，前端靠它做版本回看；
+    覆盖之后版本历史改由 Langfuse 承担（`memory-rollover` / `turn-projection` 两个 span）。
+    老的多版本行不会被删，但 `list_run_notes` 只返回最新一条、注入时也只取最新一条。
     """
 
     __tablename__ = "run_notes"
@@ -125,6 +129,10 @@ class RunNote(Base):
     content: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     #: 生成方式：projection（正常换页投影）/ recovery（回校修正）
     source: Mapped[str] = mapped_column(String(16), default="projection")
+    #: 指针作用域（D50/D62）：`session` = 会话级编号（改造后），`run` = 回合级编号（改造前）。
+    #: 注入时只认 `session` —— 老笔记里的指针在新作用域下必然歧义（同一会话有多行 W1），
+    #: 注进去只会让模型拿着一串注定报错的指针空转。
+    pointer_scope: Mapped[str] = mapped_column(String(8), default="run")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

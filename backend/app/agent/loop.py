@@ -43,6 +43,9 @@
 ════════════════════════════════════════════════════════════════════
   _extract_json_object / parse_text_action   解析文本协议里的 Action
   Step                                       一条思考/行动/观察（随消息落库 + SSE 外发）
+  session_next_window                        会话级窗口号（D50：不再每回合从 W1 重来）
+  load_notes / save_notes                    笔记的读与就地覆盖（D53 / D63）
+  refine_notes / prune_dead_refs             投影结果的统一修整（换页与收尾共用）
   build_agent_llm                            按 Agent 配置构造 LLM 客户端
   collect_prompt_variables                   提示词模板可用的变量（tools / max_rounds / agent_name）
   build_system_prompt                        拼 system prompt（提示词 + 人设 + Skills）
@@ -64,7 +67,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.checkpoints import (
@@ -144,7 +147,144 @@ DIGEST_EXCERPT_CHARS = 1500
 #: 会变成"取回原文→换页丢弃→再取回"的活锁。到达上限就本回合停用换页。
 MAX_ROLLOVERS_PER_TURN = 8
 
-async def prune_dead_refs(db: AsyncSession, notes: Notes, run_id: int | None) -> int:
+#: 回查预算占窗口的比例（D58）。**写死不做配置项** —— 它是"一次回查最多能吃掉
+#: 多少窗口"的安全阀。50% 意味着回查落地后 prompt 约 55%~65%，仍在换页阈值下方，
+#: 不会立刻触发换页；75% 会导致"回查完下一轮必换页"，等于每次大回查只买到一次 think。
+RECALL_BUDGET_RATIO = 0.5
+
+#: token → 字符的换算（中文大约 1 字符 ≈ 0.6 token）。
+#: 这是全项目**唯一**一处换算：窗口阈值按 token 算，而 recall 按字符截。
+#: 换算方向反了就是近三倍误差，而且是静默的 —— 所以集中在这一处并配了单测。
+TOKEN_PER_CHAR = 0.6
+
+#: 单条工具观察**回灌**给模型的上限（字符）。超了不是硬切，而是换成"摘要 + 真实字数 +
+#: 回查指针"的合法 JSON —— 硬切的产物是半截 JSON，模型只会误判成工具坏了。
+MAX_OBSERVATION_CHARS = 12000
+
+
+def window_tool_names_of(window_digest: list[dict[str, Any]]) -> set[str]:
+    """本窗口里"真的跑过、而且留下了指针"的工具名。
+
+    `normalize_notes` 用它挡住最严重的一种编造：投影把模型的**思考**
+    （"接下来问技术面"）记成**已完成**（"interview_hr 判定硬门槛符合"），
+    而那个工具压根没被调用。
+    """
+    return {
+        str(item.get("tool"))
+        for item in window_digest
+        if item.get("kind") == "tool" and item.get("pointer") and item.get("tool")
+    }
+
+
+async def session_next_window(db: AsyncSession, session_id: int) -> int:
+    """这个会话的下一个窗口号（D50）。
+
+    改造前窗口号每个回合都从 1 重来，所以同一会话里必然有多行 `W1`，指针要靠
+    run_id 才分得清。D50 起改成**会话内跨回合累计**：新回合 = 新窗口，接着会话
+    历史的最大值 +1，于是 `(window_index, seq)` 在会话内天然唯一。
+
+    从已有行的最大值推、而不是在 `sessions` 上加一列计数器：多一份状态就多一处
+    会漂移的地方。改造前的老行 `window_index` 多为 1~k，所以新号接着往后走，
+    **不会和老号撞车** —— 老笔记失效的原因是它的作用域变了，不是号被占了。
+    """
+    latest = 0
+    for model in (Message, ToolCall, RunNote):
+        value = await db.scalar(
+            select(func.max(model.window_index)).where(model.session_id == session_id)
+        )
+        latest = max(latest, int(value or 0))
+    return latest + 1
+
+
+async def load_notes(db: AsyncSession, session_id: int) -> RunNote | None:
+    """取这个会话当前有效的那条笔记行（D53/D63）。
+
+    只认 `pointer_scope == "session"` 的行 —— 改造前的老笔记是回合级编号，在新作用域
+    下必然歧义（同一会话有多行 `W1`），注进去只会让模型拿着一串注定报错的指针空转（D62）。
+    """
+    if session_id is None:
+        return None
+    row = (
+        await db.execute(
+            select(RunNote)
+            .where(RunNote.session_id == session_id, RunNote.pointer_scope == "session")
+            .order_by(RunNote.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    return row if row is not None and row.content else None
+
+
+async def save_notes(
+    db: AsyncSession,
+    *,
+    session_id: int,
+    run_id: int | None,
+    window_index: int,
+    notes: Notes,
+) -> None:
+    """就地覆盖这个会话的笔记（D63）。一个会话只保留一行，不追加版本。
+
+    版本历史改由 Langfuse 承担（`memory-rollover` / `turn-projection` 两个 span 的
+    output 里都带着当次的笔记），所以这里覆盖不会把排查线索弄丢。
+    """
+    row = (
+        await db.execute(
+            select(RunNote)
+            .where(RunNote.session_id == session_id)
+            .order_by(RunNote.id.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    payload = notes.model_dump()
+    if row is None:
+        db.add(
+            RunNote(
+                run_id=run_id or 0,
+                session_id=session_id,
+                window_index=window_index,
+                content=payload,
+                source="projection",
+                pointer_scope="session",
+            )
+        )
+    else:
+        row.run_id = run_id or row.run_id
+        row.window_index = window_index
+        row.content = payload
+        row.source = "projection"
+        # 老行被就地改写之后，它记的就是会话级编号了 —— 这一步同时完成 D62 的过滤依据切换
+        row.pointer_scope = "session"
+    await db.commit()
+
+
+async def refine_notes(
+    db: AsyncSession,
+    candidate: Notes,
+    previous: Notes | None,
+    *,
+    session_id: int,
+    tool_names: set[str],
+    window_digest: list[dict[str, Any]],
+) -> tuple[Notes, int, int]:
+    """把投影结果修成可用形态。返回 `(修好的笔记, 丢掉的 refs 数, 丢掉的非工具步骤数)`。
+
+    换页投影和回合收尾投影（D52）共用这一套 —— 两处都做同样的事，分开写迟早会漂移。
+    """
+    refs_before = len(candidate.refs)
+    steps_before = len(candidate.progress.stage)
+    candidate = normalize_notes(
+        candidate,
+        previous,
+        tool_names=tool_names,
+        window_tool_names=window_tool_names_of(window_digest),
+    )
+    dropped_steps = steps_before - len(candidate.progress.stage)
+    dropped_refs = refs_before - len(candidate.refs)
+    dropped_refs += await prune_dead_refs(db, candidate, session_id)
+    return candidate, dropped_refs, dropped_steps
+
+async def prune_dead_refs(db: AsyncSession, notes: Notes, session_id: int | None) -> int:
     """把指向**不存在的存档行**的 refs 丢掉，返回丢掉几条。
 
     为什么需要它：投影会从窗口记录里"抄编号"。回查结果里若出现 `未命中：W1.T5`，
@@ -152,8 +292,11 @@ async def prune_dead_refs(db: AsyncSession, notes: Notes, run_id: int | None) ->
     下游模型照着 refs 去回查，永远查不到，于是开始**猜编号**（实测连续 11 次 recall、
     3 次报错）。提示词已经禁止写"没查到"的指针，这里再兜一道底：
     **refs 里只允许留活指针**。
+
+    作用域是**会话**（D50，原先按 run_id）—— 与 `recall` 保持一致，否则跨回合的
+    消息/工具指针会被这里当成死指针删掉，笔记刚记下的东西下一轮就没了。
     """
-    if run_id is None or not notes.refs:
+    if session_id is None or not notes.refs:
         return 0
     from app.agent.notes import POINTER_RE
 
@@ -168,7 +311,7 @@ async def prune_dead_refs(db: AsyncSession, notes: Notes, run_id: int | None) ->
             await db.execute(
                 select(model.id)
                 .where(
-                    model.run_id == run_id,
+                    model.session_id == session_id,
                     model.window_index == window,
                     model.seq == seq,
                 )
@@ -530,6 +673,7 @@ async def _invoke_parallel(
     llm: LLMClient,
     session_id: int | None = None,
     run_id: int | None = None,
+    recall_budget_chars: int = 0,
 ) -> tuple[Any, dict[str, Any], str, int]:
     """并发执行用：每个任务开自己的 session。
 
@@ -556,6 +700,7 @@ async def _invoke_parallel(
             fallback_llm=llm,
             session_id=session_id,
             run_id=run_id,
+            recall_budget_chars=recall_budget_chars,
         )
     # 工具自己返回 ok=False（配置不全、参数缺失、执行报错…）时记为 error，供前端标红
     status = "ok" if observation.get("ok", True) else "error"
@@ -580,8 +725,9 @@ class TurnResult:
 
 
 # 【上次回合落库的】messages 表：user(#121) + assistant(#122, 含 text+steps)
-#                                     ↓ build_history 只取 text
-# 【本次回合开跑】内存 messages：system + [history...] + 本轮 user
+#                              ＋ run_notes 里那**一条**任务笔记（D63 就地覆盖）
+#                                     ↓ D53：注入笔记，不再拼"最近 8 条聊天记录"全文
+# 【本次回合开跑】内存 messages：system + 笔记 + 本轮 user
 #                                     ↓ 逐轮追加（不落库）
 #                                assistant(tool_calls) + tool(完整结果)
 #                                assistant(tool_calls) + tool(完整结果)
@@ -589,6 +735,7 @@ class TurnResult:
 #                                assistant(最终文本)
 #                                     ↓ 回合结束
 # 【落库】messages 表：本轮 user + 本轮 assistant（text + steps，工具结果只留摘要）
+# 【落库】run_notes：回合收尾投影一次（D52），就地覆盖那条笔记
 
 #todo ： 核心链路 run_react_turn
 async def run_react_turn(
@@ -598,7 +745,6 @@ async def run_react_turn(
     run_id: int | None,
     agent: Agent,
     user_content: str,
-    history: list[dict[str, str]],
     attachments: list[dict[str, Any]],
     emit: EmitFn,
     approval_timeout_s: float = 180,
@@ -613,6 +759,9 @@ async def run_react_turn(
 
     `user_message_id` 是本轮用户消息在 messages 表里的主键（由 sessions_router 先落库再传进来）。
     它用来给这条消息盖**存档坐标**（`window_index` + `seq`），否则笔记里的 `W1.M1` 指针永远查不到东西。
+
+    **D53：这里不再收 `history`**。原来每轮会把"最近 8 条聊天记录"的全文拼进上下文，
+    每回合重复付一大段 token；现在换成"注入本会话最新的那一条任务笔记"，原文按指针回查。
     """
     # ── 1. 解析白名单：页面勾选的工具里，哪些真的能调 ──────────────────────
     tool_rows: list[Tool] = []
@@ -626,7 +775,7 @@ async def run_react_turn(
     #: 只有这里面的名字才允许执行；模型要是调了别的，直接判死（见下面的白名单分支）
     whitelist = set(tools_by_name)
 
-    # ── 2. 组装上下文：模型客户端 + system prompt + 历史 + 本轮输入 ────────
+    # ── 2. 组装上下文：模型客户端 + system prompt + 任务笔记 + 本轮输入 ──────
     llm = await build_agent_llm(db, agent)
     system_prompt = await build_system_prompt(db, agent)
     if skipped:
@@ -637,9 +786,26 @@ async def run_react_turn(
             "、".join(tool.name for tool in skipped),
         )
 
+    # D53/D61：把本会话最新的那条笔记作为"此前发生了什么"注入，替掉原来 8 条聊天记录。
+    # D61 那句说明是必需的：用户可能在同一个会话里换话题，而系统无从判断（投影发生在
+    # 回合收尾，那时下一轮的问题还不存在）—— 唯一同时看到笔记和新问题的角色是主模型。
+    carried_row = await load_notes(db, session_id)
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    for item in history:
-        messages.append({"role": item["role"], "content": item["content"]})
+    if carried_row is not None:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "【本会话此前的任务笔记】\n"
+                    f"{json.dumps(carried_row.content, ensure_ascii=False, indent=2)}\n\n"
+                    "说明：以上是**本会话此前几轮**留下的任务状态，不是用户本轮提出的要求。"
+                    "如果用户这次说的与它无关（换了话题），请忽略它、按新任务重新规划；"
+                    "如果相关，先读 progress，别重复已经做完的事。"
+                    "笔记里只有要点，需要原文时用 recall 按指针回查"
+                    "（`W<窗口>.M<序号>` 是对话消息，`W<窗口>.T<序号>` 是工具结果）。"
+                ),
+            }
+        )
 
     user_text = user_content
     if attachments:
@@ -659,6 +825,9 @@ async def run_react_turn(
     tool_call_ids: list[int] = []
     max_rounds = agent.max_rounds or 12
     final_text = ""
+    #: 最终回答在窗口里的序号。正常收尾时下面会为它占一个号（digest 里 kind="answer"
+    #: 那条），撞到轮次上限时没占 —— 由 return 处兜底补一个。
+    answer_seq = 0
     #: 本轮新增消息的起点（只影响 Langfuse 上报，见 client._report_generation）
     new_from = 0
     # 本回合的"确认记忆"——生命周期就是**这一次对话回合**，下一轮用户消息进来就重置。
@@ -671,17 +840,28 @@ async def run_react_turn(
     # 窗口 = 模型当前能看到的上下文。快满时整段换掉，任务连续性靠笔记 + 存档指针。
     #: 换页阈值（token）。0 表示不启用（模型没配 context_window 时）。
     window_limit = 0
+    recall_budget_chars = 0
     if agent.model_config_id:
         _model = await db.get(ModelConfig, agent.model_config_id)
         if _model is not None and int(_model.context_window or 0) > 0:
             pct = int(getattr(agent, "context_threshold_pct", 80) or 80)
             window_limit = int(_model.context_window) * max(min(pct, 95), 10) // 100
-    #: 当前窗口号，每次换页 +1；指针里的 W 就是它
-    window_index = 1
+            #: 回查预算（D58）：窗口上限 × 50%，换算成**字符**交给 recall。
+            #: 这是全项目唯一一处 token→字符换算（见 TOKEN_PER_CHAR 的注释）。
+            recall_budget_chars = int(window_limit * RECALL_BUDGET_RATIO / TOKEN_PER_CHAR)
+    #: 当前窗口号（D50）。**会话内跨回合累计**：新回合 = 新窗口，接在会话历史的最大值
+    #: 之后，所以 `(window_index, seq)` 在整个会话里唯一，指针不再需要 run_id 才分得清。
+    window_index = await session_next_window(db, session_id)
     #: 窗口内统一序号：每追加"一条可寻址的条目"（用户输入 / 工具调用 / 最终回答）+1
     window_seq = 0
-    #: 当前笔记（物化后的任务状态），换页时注入上下文
+    #: 当前笔记（物化后的任务状态）。**从上一轮留下的那条接着写**（D4 追加语义），
+    #: 而不是从空的开始——否则 progress 里的"已完成步骤"每轮都会被清掉一次。
     notes: Notes | None = None
+    if carried_row is not None:
+        try:
+            notes = Notes.model_validate(carried_row.content)
+        except Exception as exc:  # noqa: BLE001 - 笔记读不回来不能挡住这一轮对话
+            logger.warning("上一版笔记解析失败，本轮按空笔记开始：%s", exc)
     #: 上一轮的 prompt token 数与增量，用来预测"下一轮会不会顶到上限"
     last_prompt_tokens = 0
     last_delta = 0
@@ -819,6 +999,20 @@ async def run_react_turn(
                 or result.content
                 or "（模型没有返回内容）"
             )
+            # D52：最终回答也要进 digest —— 它是下一轮最该被摘要的东西。
+            # 改造前三处 append 只有 user/thought/tool，模型给出最终回答时代码直接 break，
+            # 于是 render_window_digest 里预留的 "answer" 标签从来没人用，投影只能从
+            # "过程"里猜结论。占的这个号同时也给 sessions_router 盖给 assistant 消息。
+            window_seq += 1
+            answer_seq = window_seq
+            window_digest.append(
+                {
+                    "pointer": f"W{window_index}.M{window_seq}",
+                    "kind": "answer",
+                    "text": final_text[:300],
+                    "round": round_index,
+                }
+            )
             break
 
         # 低效触发的依据：本轮调了哪些工具、参数是什么。
@@ -925,41 +1119,32 @@ async def run_react_turn(
                         window_digest=render_window_digest(window_digest),
                         latest_thought=latest_thought,
                     )
-                    refs_before = len(candidate.refs)
-                    steps_before = len(candidate.progress.stage)
                     # 传 whitelist 进去：`progress.stage` 只允许记"真实工具干的事"，
-                    # 非工具步骤（"直接判断：…"）会被丢掉。
-                    # window_tool_names 是"本窗口真的跑过、并且留下指针的工具"，
-                    # 用来挡住"把思考当成已完成"这种编造进度。
-                    candidate = normalize_notes(
+                    # 非工具步骤（"直接判断：…"）会被丢掉；window_tool_names 是"本窗口
+                    # 真的跑过、并且留下指针的工具"，用来挡住"把思考当成已完成"这种编造。
+                    # normalize + 死指针清理与回合收尾投影（D52）共用同一套，避免两处漂移。
+                    candidate, dropped_refs, dropped_steps = await refine_notes(
+                        db,
                         candidate,
                         notes,
+                        session_id=session_id,
                         tool_names=whitelist,
-                        window_tool_names={
-                            str(item.get("tool"))
-                            for item in window_digest
-                            if item.get("kind") == "tool" and item.get("pointer") and item.get("tool")
-                        },
+                        window_digest=window_digest,
                     )
-                    dropped_steps = steps_before - len(candidate.progress.stage)
-                    dropped_refs = refs_before - len(candidate.refs)
-                    # 再兜一道底：refs 里只留**真实存在**的存档指针
-                    dropped_refs += await prune_dead_refs(db, candidate, run_id)
                     problems = verify_notes(candidate, notes)
                 except Exception as exc:  # noqa: BLE001 - 投影失败绝不能影响主流程
                     logger.warning("笔记投影失败，本次不换页：%s", exc)
                     candidate, problems = None, ["投影调用失败"]
 
                 if candidate is not None and not problems:
-                    db.add(
-                        RunNote(
-                            run_id=run_id or 0,
-                            session_id=session_id,
-                            window_index=window_index + 1,
-                            content=candidate.model_dump(),
-                        )
+                    # D63：就地覆盖这个会话的笔记，不再追加版本行
+                    await save_notes(
+                        db,
+                        session_id=session_id,
+                        run_id=run_id,
+                        window_index=window_index + 1,
+                        notes=candidate,
                     )
-                    await db.commit()
                     notes = candidate
                     window_index += 1
                     window_seq = 0
@@ -1102,6 +1287,7 @@ async def run_react_turn(
                             llm,
                             session_id=session_id,
                             run_id=run_id,
+                            recall_budget_chars=recall_budget_chars,
                         )
                         for call in pending
                     ]
@@ -1189,6 +1375,7 @@ async def run_react_turn(
                         fallback_llm=llm,
                         session_id=session_id,
                         run_id=run_id,
+                        recall_budget_chars=recall_budget_chars,
                     )
                     status = "ok" if observation.get("ok", True) else "error"
                     record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1266,6 +1453,7 @@ async def run_react_turn(
                             fallback_llm=llm,
                             session_id=session_id,
                             run_id=run_id,
+                            recall_budget_chars=recall_budget_chars,
                         )
                         status = "ok" if observation.get("ok", True) else "error"
                         record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1279,6 +1467,7 @@ async def run_react_turn(
                         fallback_llm=llm,
                         session_id=session_id,
                         run_id=run_id,
+                        recall_budget_chars=recall_budget_chars,
                     )
                     status = "ok" if observation.get("ok", True) else "error"
                     record.elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1325,8 +1514,31 @@ async def run_react_turn(
             )
 
             # 回灌给模型：这是 ReAct 的"观察"环节，也是下一轮模型能看到的**新信息**。
-            # `[:12000]` 防止一次大结果把上下文撑爆。
-            payload_json = json.dumps(observation, ensure_ascii=False)[:12000]
+            # 大结果不能整段塞回去，但也**绝不能按字符硬切**：切出来的是半截 JSON，
+            # 模型解析不了，只会误判成"工具坏了"或者把残片当成内容本身（改造前就是
+            # `[...][:12000]`，切得越频繁、结果越像乱码）。这里换成一条**合法 JSON**：
+            # 摘要 + 真实字数 + 回查指针，需要明细时按指针拉原文（D57 同一个思路）。
+            payload_json = json.dumps(observation, ensure_ascii=False)
+            if len(payload_json) > MAX_OBSERVATION_CHARS:
+                recall_pointer = f"W{window_index}.T{window_seq}" if tool is not None else ""
+                payload_json = json.dumps(
+                    {
+                        "ok": observation.get("ok", True),
+                        "summary": str(observation.get("summary") or "")[:500],
+                        "truncated": True,
+                        "full_chars": len(payload_json),
+                        "recall_pointer": recall_pointer,
+                        "hint": (
+                            "这条工具结果太大，没有整体回灌；summary 是它的要点。"
+                            + (
+                                f"需要完整明细请用 recall 取 `{recall_pointer}`。"
+                                if recall_pointer
+                                else "需要明细请换一种更小范围的调用方式。"
+                            )
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             if text_protocol:
                 # 文本协议没有 tool_call_id，用一条 `Observation: {...}` 的 user 消息回灌
                 messages.append({"role": "user", "content": f"Observation: {payload_json}"})
@@ -1363,6 +1575,66 @@ async def run_react_turn(
         final_text = "（模型没有给出最终回答）"
         await emit("token", {"round": 0, "delta": final_text})
 
+    # ── 回合收尾投影（D52/D60）─────────────────────────────────────────────
+    # 投影原来只在换页时跑，所以**不换页的回合什么都没留下**：下个回合没有笔记可注入，
+    # 只能靠"最近 8 条聊天记录"续命（D53 已经把它拿掉了）。这里再跑一次，输入就是本
+    # 窗口的流水 —— 含刚补进去的那条最终回答。这是"每轮对话都有摘要"的唯一保证。
+    if window_digest:
+        with trace_span(
+            "turn-projection",
+            as_type="span",
+            input={"window_index": window_index, "digest_entries": len(window_digest)},
+            metadata={"session_id": session_id, "run_id": run_id, "at": "turn-end"},
+        ) as turn_span:
+            candidate: Notes | None = None
+            problems: list[str] = []
+            dropped_refs = 0
+            dropped_steps = 0
+            try:
+                candidate = await project_notes(
+                    llm=llm,
+                    previous=notes,
+                    window_digest=render_window_digest(window_digest),
+                    latest_thought=latest_thought,
+                )
+                candidate, dropped_refs, dropped_steps = await refine_notes(
+                    db,
+                    candidate,
+                    notes,
+                    session_id=session_id,
+                    tool_names=whitelist,
+                    window_digest=window_digest,
+                )
+                problems = verify_notes(candidate, notes)
+            except Exception as exc:  # noqa: BLE001 - 收尾投影失败绝不能影响这一轮的回答
+                logger.warning("回合收尾投影失败（本轮回答不受影响）：%s", exc)
+                candidate, problems = None, ["投影调用失败"]
+            if candidate is not None and not problems:
+                # D63：就地覆盖，不追加版本行
+                await save_notes(
+                    db,
+                    session_id=session_id,
+                    run_id=run_id,
+                    window_index=window_index,
+                    notes=candidate,
+                )
+                notes = candidate
+                logger.info("回合收尾笔记已更新（窗口 W%s）", window_index)
+            else:
+                # 宁可留给下一轮一份旧笔记，也不能写进一份残缺的
+                logger.warning("回合收尾笔记校验未通过，保留上一版：%s", problems)
+            if turn_span is not None:
+                with contextlib.suppress(Exception):
+                    turn_span.update(
+                        output={
+                            "updated": candidate is not None and not problems,
+                            "note": candidate.model_dump() if candidate else None,
+                            "problems": problems,
+                            "dropped_refs": dropped_refs,
+                            "dropped_non_tool_steps": dropped_steps,
+                        }
+                    )
+
     # 回合结束：把终态写进 checkpoint（前端可能还在重连，需要知道"已经完了"）
     if checkpoint is not None:
         checkpoint.status = "finished"
@@ -1379,8 +1651,9 @@ async def run_react_turn(
         steps=[step.dump() for step in steps],
         rounds=len(steps),
         tool_call_ids=tool_call_ids,
-        # 最终回答也要可寻址：占用窗口里的下一个 seq。
-        # sessions_router 拿这两个值给 assistant 消息盖坐标（否则 `W*.M*` 只覆盖用户消息）。
+        # 最终回答也要可寻址，sessions_router 拿这两个值给 assistant 消息盖坐标。
+        # 正常收尾时上面已经为它占了号（digest 里 kind="answer" 那条），两边必须是同一个；
+        # 撞到轮次上限、或压根没给出回答时没占过号，这里补一个。
         window_index=window_index,
-        seq=window_seq + 1,
+        seq=answer_seq or (window_seq + 1),
     )

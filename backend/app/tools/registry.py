@@ -220,12 +220,16 @@ async def execute_tool(
     fallback_llm: LLMClient | None = None,
     session_id: int | None = None,
     run_id: int | None = None,
+    recall_budget_chars: int = 0,
 ) -> dict[str, Any]:
     """会话与测试场共用的唯一执行入口。任何失败都返回观察结果，不抛异常。
 
     外面包一层 `as_type="tool"` 的 observation：Langfuse v4 会把它渲染成工具调用，
     一眼能看到"调了哪个工具、传了什么参数、拿回什么结果"，而不用去 generation 的
     output JSON 里翻。观测失败静默降级，不影响执行。
+
+    `recall_budget_chars`（D58）是给 `recall` 用的字符预算，由主循环算好传下来 ——
+    工具自己拿不到模型的上下文窗口，只能由调用方给。
     """
     from app.obs.langfuse import observation as trace_span
 
@@ -245,6 +249,7 @@ async def execute_tool(
             fallback_llm=fallback_llm,
             session_id=session_id,
             run_id=run_id,
+            recall_budget_chars=recall_budget_chars,
         )
         if span is not None:
             with contextlib.suppress(Exception):
@@ -260,6 +265,7 @@ async def _execute(
     fallback_llm: LLMClient | None = None,
     session_id: int | None = None,
     run_id: int | None = None,
+    recall_budget_chars: int = 0,
 ) -> dict[str, Any]:
     spec = get_impl(tool.impl_key)
     if spec is None:
@@ -273,7 +279,14 @@ async def _execute(
     if args_error:
         return _fail(args_error, "bad_arguments")
     config = dict(tool.impl_config or {})
-    ctx = ToolContext(tool=tool, config=config, db=db, session_id=session_id, run_id=run_id)
+    ctx = ToolContext(
+        tool=tool,
+        config=config,
+        db=db,
+        session_id=session_id,
+        run_id=run_id,
+        recall_budget_chars=recall_budget_chars,
+    )
 
     if spec.needs_prompt:
         try:

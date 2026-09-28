@@ -155,18 +155,34 @@ def propagated(
     if client is None:
         yield
         return
+
+    # ⚠️ 只把「建立传播上下文」这一步包进 try。
+    #
+    # 改造前是 `try: with propagate_attributes(...): yield`（整段包起来），后果很严重：
+    # **业务体抛的异常也会被这个 except 吞掉**，然后第二次 `yield` —— contextlib 于是报
+    # `RuntimeError: generator didn't stop after throw()`，把真正的错误盖成一团噪音。
+    # 实测踩过：数据库少一列（`Unknown column`）在日志里完全看不出来，最外层只剩
+    # 一句"generator didn't stop after throw()"，排查方向直接跑偏。
+    # 观测是旁路，**绝不能改写主流程的异常**，所以业务体的 yield 必须待在 try 外面。
+    cm: Any = None
     try:
         from langfuse import propagate_attributes
 
-        with propagate_attributes(
+        cm = propagate_attributes(
             session_id=session_id or None,
             user_id=user_id or None,
             tags=tags or None,
-        ):
-            yield
+        )
+        cm.__enter__()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Langfuse 属性传播失败，已降级：%s", exc)
+        logger.warning("Langfuse 属性传播不可用，已降级：%s", exc)
+        cm = None
+    try:
         yield
+    finally:
+        if cm is not None:
+            with contextlib.suppress(Exception):
+                cm.__exit__(None, None, None)
 
 
 def current_trace_id() -> str:

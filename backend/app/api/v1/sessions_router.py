@@ -61,7 +61,7 @@ from app.schemas.session import (
     SessionOut,
     SessionUpdate,
 )
-from app.services.conversation import build_history, make_title
+from app.services.conversation import make_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["会话"])
@@ -190,23 +190,26 @@ async def list_attachments(
 async def list_run_notes(
     session_id: int, limit: int = 20, db: AsyncSession = Depends(get_db)
 ) -> list[dict[str, Any]]:
-    """会话的任务笔记（D48）：每次换页写一条，按时间正序返回最近 `limit` 条。
+    """会话当前有效的那一条任务笔记（D48 / D63）。
 
-    前端拿它渲染「任务进度卡」——**最后一条就是当前有效状态**
-    （goal / progress / decisions / plan / refs），前面几条作为换页历史可折叠回看。
+    返回 0 或 1 条：笔记现在是**就地覆盖**（一个会话一行），不再有版本历史 ——
+    每次投影改同一行，旧版本只在 Langfuse 的 span 里。所以 `limit` 已经不起作用，
+    保留参数只是为了不改动调用方签名。
 
-    没触发过换页时返回空数组（正常现象：上下文没满就不换页）。
+    只返回 `pointer_scope == "session"` 的行：改造前的老笔记是回合级编号，在新作用域
+    下指针必然歧义，既不会被注入模型、也不该冒充"模型此刻记得什么"（D62）。
+
+    没跑过回合时返回空数组（正常现象：还没聊过）。
     """
 
     async def load() -> list[dict[str, Any]]:
         stmt = (
             select(RunNote)
-            .where(RunNote.session_id == session_id)
+            .where(RunNote.session_id == session_id, RunNote.pointer_scope == "session")
             .order_by(RunNote.id.desc())
-            .limit(max(1, min(limit, 100)))
+            .limit(1)
         )
         rows = list((await db.execute(stmt)).scalars().all())
-        rows.reverse()  # 倒序取最近 N 条，翻正后给前端按时间正序渲染
         return [
             {
                 "id": row.id,
@@ -405,9 +408,8 @@ async def _turn_stream(
                     user_message_id = user_message.id
                     invalidate_session(session_id)
 
-                history = await build_history(db, session_id, 8)
-                if history and history[-1]["role"] == "user":
-                    history = history[:-1]
+                # D53：不再拼"最近 8 条聊天记录"的全文 —— 跨回合的连续性改由
+                # 「最新一条任务笔记 + 按指针回查原文」承担（见 loop.load_notes）。
                 attachments = (
                     [
                         {
@@ -461,7 +463,6 @@ async def _turn_stream(
                             run_id=run_id,
                             agent=agent,
                             user_content=text,
-                            history=history,
                             attachments=attachments,
                             emit=emit,
                             user_message_id=user_message_id,

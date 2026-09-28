@@ -102,3 +102,59 @@ def test_client_status_reports_unconfigured(monkeypatch: pytest.MonkeyPatch) -> 
     assert state["configured"] is False
     assert state["ok"] is False
     assert "LANGFUSE" in state["error"]
+
+
+def test_propagated_does_not_swallow_body_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归：`with propagated(...)` 里抛出的异常必须**原样穿出去**。
+
+    改造前代码是 `try: with propagate_attributes(...): yield`（整段包起来），于是业务体
+    的异常也被那个 except 吞掉，然后第二次 `yield` —— contextlib 报
+    `RuntimeError: generator didn't stop after throw()`，真正的错误被盖成一团噪音。
+    实测踩过：数据库少一列（`Unknown column 'run_notes.pointer_scope'`）在日志里完全
+    看不出来，最外层只剩"generator didn't stop after throw()"，排查方向直接跑偏。
+
+    观测是旁路，绝不能改写主流程的异常。
+    """
+    import sys
+    import types
+
+    class FakeCM:
+        def __init__(self) -> None:
+            self.exited = False
+
+        def __enter__(self) -> FakeCM:
+            return self
+
+        def __exit__(self, *_exc: object) -> bool:
+            self.exited = True
+            return False
+
+    entered: list[FakeCM] = []
+    fake_module = types.ModuleType("langfuse")
+    fake_module.propagate_attributes = lambda **_kw: (  # type: ignore[attr-defined]
+        entered.append(FakeCM()) or entered[-1]
+    )
+    monkeypatch.setitem(sys.modules, "langfuse", fake_module)
+    monkeypatch.setattr(obs, "get_client", lambda: object())
+
+    with pytest.raises(ValueError, match="来自业务体"):
+        with obs.propagated(session_id="session_1"):
+            raise ValueError("来自业务体")
+
+    assert entered and entered[0].exited, "传播上下文仍然要正常退出"
+
+
+def test_propagated_degrades_when_sdk_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SDK 里没有 `propagate_attributes` 时静默降级，不影响业务体跑完。"""
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "langfuse", types.ModuleType("langfuse"))
+    monkeypatch.setattr(obs, "get_client", lambda: object())
+
+    ran = False
+    with obs.propagated(session_id="session_1"):
+        ran = True
+    assert ran

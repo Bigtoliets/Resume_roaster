@@ -1,4 +1,4 @@
-"""回查存档（D48）：指针的作用域是**回合**，以及入参的两种形状。
+"""回查存档（D48 / D50 / D57）：指针作用域、入参形状，以及"不静默截断"。
 
 三个点都是实测翻车过才补的：
   - 完全不限作用域 → `W1.T2` 在所有会话里都存在 → `MultipleResultsFound`，
@@ -6,6 +6,9 @@
   - 只按 `session_id` 过滤 → 同一会话的**第二个回合**开始撞（每个回合窗口号
     都从 W1 重新开始），同样报 `MultipleResultsFound`；
   - 只收单个 `pointer` → 模型天然写成 `{"pointers": [...]}`，第一次调用必然被拒。
+
+**D50 把第二条的成因消掉了**：窗口号改成会话内跨回合累计，`(window_index, seq)`
+在整个会话里唯一，所以作用域从 run 退回 session；run_id 只留作排查。
 """
 
 from __future__ import annotations
@@ -67,25 +70,56 @@ async def test_missing_pointer_parameter() -> None:
     assert db.statements == []  # 参数不对就别去查库
 
 
-async def test_query_is_scoped_to_run() -> None:
-    """核心回归：有 run_id 时必须按 run 过滤。
+async def test_query_is_scoped_to_session_and_not_run() -> None:
+    """核心回归：按**会话**过滤，且不再按 run 过滤（D50）。
 
-    每个回合的窗口号都从 W1 重新开始，只按 session 过滤会让同一会话的
-    第二回合撞上第一回合（实测 `MultipleResultsFound`，整个诊断卡死）。
+    改造前必须按 run_id 过滤：那时窗口号每个回合都从 W1 重来，同一会话里必然有多行
+    `W1`，只按 session 过滤会让第二回合撞上第一回合（实测 `MultipleResultsFound`，
+    整个诊断卡死）。D50 把窗口号改成会话内跨回合累计之后 `(window_index, seq)` 唯一，
+    于是 run_id 退出定位 —— **SQL 里不该再出现它，出现就说明作用域没换干净**。
     """
     db = _RecordingDb()
+    # 故意递一个 run_id：它必须被忽略
     await recall_run(
         {"args": {"pointers": ["W1.T2"]}, "config": {}}, make_ctx(63, db, run_id=4242)
     )
     assert len(db.statements) == 1
-    assert "run_id = 4242" in db.statements[0]
+    assert "session_id = 63" in db.statements[0]
+    assert "run_id = 4242" not in db.statements[0]
 
 
-async def test_query_falls_back_to_session_without_run() -> None:
-    """测试场之类拿不到 run_id 时退回会话作用域，至少不会跨会话串数据。"""
+async def test_query_works_without_run_id() -> None:
+    """拿不到 run_id 时（测试场、后台任务）照样按会话查，不会跨会话串数据。"""
     db = _RecordingDb()
     await recall_run({"args": {"pointers": ["W1.T2"]}, "config": {}}, make_ctx(77, db))
     assert "session_id = 77" in db.statements[0]
+
+
+async def test_batch_depth_is_split_by_budget_without_dropping_items() -> None:
+    """D57：点名的每条都给，深度按总预算摊 —— 条数越多每条越浅，但一条都不丢。"""
+    from app.tools.recall import MIN_ITEM_CHARS, _per_item_chars
+
+    assert _per_item_chars(8000, 1) == 8000  # 只要一条就吃满预算
+    assert _per_item_chars(8000, 8) == 1000
+    assert _per_item_chars(8000, 32) == MIN_ITEM_CHARS  # 摊到底也不低于下限
+    # 刻意没有"单条硬上限"：预算多大单条就能给多大，否则 D58 的百分比预算会被静默压掉
+    assert _per_item_chars(40000, 1) == 40000
+
+
+async def test_truncated_item_reports_true_total_length() -> None:
+    """D57：截断可以，**静默**截断不行 —— label 必须报原文真实字数。
+
+    改造前 label 用的是 `len(截断后的文本)`，等于告诉模型"就这么多"。这是笔记里
+    出现"截断/不全"、进而反复回查的根因（见 D49）。
+    """
+    row = SimpleNamespace(content={"text": "字" * 9000}, role="user")
+    db = _RecordingDb(rows=[row])
+    ctx = make_ctx(63, db)
+    ctx.recall_budget_chars = 1000  # 预算只够 1000 字
+    result = await recall_run({"args": {"pointer": "W1.M1"}, "config": {}}, ctx)
+    item = result["data"]["items"][0]
+    assert len(item["text"]) == 1000
+    assert "原文共 9000 字" in item["label"]
 
 
 async def test_ambiguous_pointer_is_reported_not_crashed() -> None:

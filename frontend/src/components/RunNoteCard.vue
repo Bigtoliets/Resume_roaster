@@ -6,26 +6,19 @@
  * 这份笔记。用户能在这里看到"模型此刻到底记得什么"，出问题时也一眼能定位——
  * 是笔记写漏了，还是模型自己想岔了。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 
 import type { RunNoteContent, RunNoteRow } from '@/api/types'
 
 const props = defineProps<{ notes: RunNoteRow[]; defaultOpen?: boolean }>()
 
-/** 默认看**最后一条**（= 当前有效状态）；用户可以在下拉里回看历史版本。 */
-const activeId = ref<number | null>(props.notes.at(-1)?.id ?? null)
-watch(
-  () => props.notes,
-  (list) => {
-    // 列表更新（新一轮换页）时自动跳到最新那条，除非用户在手动回看历史
-    const latest = list.at(-1)
-    if (latest && !list.some((item) => item.id === activeId.value)) activeId.value = latest.id
-  },
-)
-
-const active = computed(
-  () => props.notes.find((item) => item.id === activeId.value) ?? props.notes.at(-1) ?? null,
-)
+/**
+ * D63：笔记改成**就地覆盖**，后端只会返回 0 或 1 条（一个会话一份），所以这里不再有
+ * "版本下拉"——这张卡展示的永远是当前有效状态，也就是模型此刻真正记得的东西。
+ * 想回看历史版本只能去 Langfuse：换页（`memory-rollover`）和回合收尾
+ * （`turn-projection`）两个 span 的 output 里都带着当次的笔记。
+ */
+const active = computed(() => props.notes.at(-1) ?? null)
 const content = computed<RunNoteContent>(() => active.value?.content ?? {})
 
 /**
@@ -54,7 +47,7 @@ const open = ref(props.defaultOpen ?? false)
   <div v-if="notes.length" class="note">
     <button class="note__head" type="button" @click="open = !open">
       <span class="note__badge">🧭</span>
-      <span class="note__title">任务笔记 · 第 {{ notes.length }} 版</span>
+      <span class="note__title">任务笔记</span>
       <span class="pill pill--seal">窗口 W{{ active?.window_index ?? 1 }}</span>
       <span v-if="steps.length" class="pill">{{ steps.length }} 步已完成</span>
       <span v-if="content.refs?.length" class="pill">{{ content.refs.length }} 条引用</span>
@@ -63,16 +56,6 @@ const open = ref(props.defaultOpen ?? false)
     </button>
 
     <div v-if="open" class="note__body">
-      <div v-if="notes.length > 1" class="note__picker">
-        <span class="eyebrow">版本</span>
-        <select v-model.number="activeId">
-          <option v-for="(item, index) in notes" :key="item.id" :value="item.id">
-            第 {{ index + 1 }} 版 · 窗口 W{{ item.window_index }}
-          </option>
-        </select>
-        <span class="hint" style="margin: 0">最后一版才是当前状态，前面的只作回看</span>
-      </div>
-
       <div class="note__cell">
         <div class="eyebrow">目标</div>
         <p class="note__text">{{ content.goal || '—' }}</p>
@@ -143,19 +126,6 @@ const open = ref(props.defaultOpen ?? false)
   padding: 4px 12px 12px;
   display: grid;
   gap: 10px;
-}
-
-.note__picker {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.note__picker select {
-  width: auto;
-  padding: 3px 8px;
-  font-size: 12px;
 }
 
 .note__grid {
