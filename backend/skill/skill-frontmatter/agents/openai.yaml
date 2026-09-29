@@ -1,0 +1,3 @@
+interface:
+  display_name: "Skill Frontmatter"
+  short_description: "Constrain SKILL.md frontmatter to allowed fields"
