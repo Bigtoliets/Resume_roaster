@@ -39,6 +39,7 @@ const {
   max_rounds: 12,
   context_threshold_pct: 80,
   parallel_tools: true,
+  auto_distill: false,
   params_override: {},
   is_enabled: true,
 }))
@@ -136,6 +137,15 @@ onMounted(load)
             <span>{{ draft.is_enabled ? '启用' : '停用' }}</span>
           </label>
         </FormRow>
+        <FormRow
+          label="自动蒸馏"
+          hint="回合结束后（成功或失败）自动把这一回合的完整轨迹，蒸馏进经验 skill。开启后每回合都会改写 backend/skill/operation-experience/SKILL.md，不需要就关掉"
+        >
+          <label class="row" style="gap: 6px">
+            <input type="checkbox" style="width: auto" v-model="draft.auto_distill" />
+            <span>{{ draft.auto_distill ? '开启' : '关闭' }}</span>
+          </label>
+        </FormRow>
       </div>
 
       <FormRow label="描述">
@@ -146,7 +156,10 @@ onMounted(load)
         <textarea rows="4" spellcheck="false" v-model="draft.persona" />
       </FormRow>
 
-      <FormRow label="挂载 Skills" hint="Skill 的指令会作为附加约束拼进系统提示词">
+      <FormRow
+        label="挂载 Skills"
+        hint="正文从 backend/skill/<name>/SKILL.md 读取，拼进系统提示词（勾选的是名字，不是正文）"
+      >
         <RefMulti slug="skills" v-model="draft.skill_ids" empty-hint="还没有 Skill" />
       </FormRow>
 
@@ -179,6 +192,7 @@ onMounted(load)
             <div>
               换页阈值：上下文窗口的 {{ draft.context_threshold_pct ?? 80 }}%（窗口大小在模型配置页设置）
             </div>
+            <div>自动蒸馏：{{ draft.auto_distill ? '开启（回合结束后改写经验 skill）' : '关闭' }}</div>
           </div>
           <p class="hint" style="margin-top: 8px">
             可选 Skill {{ skills.items.length }} 个 · 可选工具 {{ tools.items.length }} 个

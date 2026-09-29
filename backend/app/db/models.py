@@ -161,14 +161,20 @@ class KnowledgeBase(Base, TimestampMixin):
 
 
 class Skill(Base, TimestampMixin):
-    """独立的文本增强单元：只含指令，不引用任何其他资源（D25）。"""
+    """平台资源索引（SD16）：**正文在文件里**，这张表只存名字与描述。
+
+    `backend/skill/<name>/SKILL.md` 是唯一真源；这张表是索引，靠"启动对账 +
+    写路径同步"保持一致（见 `app/skill/sync.py`）。
+
+    `instructions` 列已删除 —— 正文搬到文件后，留在库里就只会制造
+    "表说 A、盘上说 B" 的第二真相。
+    """
 
     __tablename__ = "skills"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
-    description: Mapped[str] = mapped_column(String(255), default="")
-    instructions: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(String(1024), default="")
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
@@ -191,6 +197,8 @@ class Agent(Base, TimestampMixin):
     context_threshold_pct: Mapped[int] = mapped_column(Integer, default=80)
     #: 同一轮里模型一次调多个工具时，是否并发执行（默认开）
     parallel_tools: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: 回合结束后是否自动跑 skill 蒸馏线路（SD22，默认关）
+    auto_distill: Mapped[bool] = mapped_column(Boolean, default=False)
     params_override: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 

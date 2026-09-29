@@ -16,6 +16,10 @@ const props = defineProps<{
   error: string
   search: string
   locked?: boolean
+  /** 传 false 隐藏「复制」（Skills 页不可复制：正文在文件里，复制没有意义） */
+  allowDuplicate?: boolean
+  /** 传 false 隐藏「删除」（Skills 页只允许删孤儿行，由页面按行决定） */
+  allowDelete?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -99,6 +103,14 @@ function displayName(item: ResourceRow): string {
             <span class="workbench__item-meta">
               <span class="mono">#{{ item.id }}</span>
               <span
+                v-if="item.is_orphan"
+                class="pill pill--warn"
+                style="padding: 0 6px"
+                title="表里有这行，但 backend/skill/ 下已经没有对应目录"
+              >
+                孤儿
+              </span>
+              <span
                 v-if="item.is_enabled === false"
                 class="pill pill--warn"
                 style="padding: 0 6px"
@@ -122,10 +134,16 @@ function displayName(item: ResourceRow): string {
             <div v-if="!isNew" class="eyebrow" style="margin-top: 2px">ID #{{ selectedId }}</div>
           </div>
           <div class="row" style="gap: 8px">
-            <button class="btn btn--ghost btn--sm" type="button" :disabled="isNew" @click="emit('duplicate')">
+            <button
+              v-if="allowDuplicate !== false"
+              class="btn btn--ghost btn--sm"
+              type="button"
+              :disabled="isNew"
+              @click="emit('duplicate')"
+            >
               复制
             </button>
-            <template v-if="!isNew">
+            <template v-if="!isNew && allowDelete !== false">
               <button class="btn btn--ghost btn--sm" type="button" @click="askDelete">
                 删除
               </button>

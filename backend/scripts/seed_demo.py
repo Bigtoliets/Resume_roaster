@@ -167,32 +167,33 @@ async def main() -> None:
                 "is_enabled": True,
             },
         )
-        skill_cache = await upsert(
+        # Skill 正文在文件里（SD16）：seed 会**同时落盘 + 建索引行**。
+        # 名字必须是合法 slug（小写字母/数字/连字符）—— 规范要求 frontmatter 的 name
+        # 与目录名一致，中文名会让文件无法通过校验。
+        skill_cache = await upsert_skill(
             db,
-            Skill,
-            name="缓存方案拷问",
-            defaults={
-                "description": "提到缓存就必须追问四个场景",
-                "instructions": (
-                    "涉及 Redis / 缓存时，必须确认四件事：穿透（布隆过滤器/空值缓存）、"
-                    "雪崩（过期时间打散/多级缓存）、击穿（互斥锁/逻辑过期）、"
-                    "与数据库一致性（延迟双删/订阅 binlog）。缺失即视为「只有名词没有场景」。"
-                ),
-                "is_enabled": True,
-            },
+            name="cache-questioning",
+            description="提到缓存就必须追问四个场景（穿透/雪崩/击穿/一致性）",
+            body=(
+                "涉及 Redis / 缓存时，必须确认四件事：\n\n"
+                "1. 穿透：布隆过滤器 / 空值缓存\n"
+                "2. 雪崩：过期时间打散 / 多级缓存\n"
+                "3. 击穿：互斥锁 / 逻辑过期\n"
+                "4. 与数据库一致性：延迟双删 / 订阅 binlog\n\n"
+                "缺失即视为「只有名词没有场景」。"
+            ),
         )
-        skill_metric = await upsert(
+        skill_metric = await upsert_skill(
             db,
-            Skill,
-            name="量化产出审查",
-            defaults={
-                "description": "检查是否有可验证的业务指标与个人贡献",
-                "instructions": (
-                    "每个项目都要能回答：QPS/延迟/数据量/成本是多少？个人贡献与团队成果如何区分？"
-                    "优化前后对比是多少？缺失就问，不要替候选人假设。"
-                ),
-                "is_enabled": True,
-            },
+            name="quantified-output-review",
+            description="检查项目是否有可验证的业务指标与个人贡献",
+            body=(
+                "每个项目都要能回答：\n\n"
+                "- QPS / 延迟 / 数据量 / 成本分别是多少？\n"
+                "- 个人贡献与团队成果如何区分？\n"
+                "- 优化前后对比是多少？\n\n"
+                "缺失就问，不要替候选人假设。"
+            ),
         )
 
         tool_kb = await upsert(
@@ -344,6 +345,26 @@ async def upsert(db, model, *, name: str, defaults: dict):  # type: ignore[no-un
         row.is_enabled = True
     await db.flush()
     return row
+
+
+async def upsert_skill(db, *, name: str, description: str, body: str):  # type: ignore[no-untyped-def]
+    """Skill 的 seed：**正文写文件**（唯一真源），表里那一行只是索引（SD16）。
+
+    文件已存在就不覆盖（避免每次 seed 冲掉蒸馏线路积累的内容）。
+    """
+    from app.skill.store import create_skill, read_skill, skill_path
+
+    if not skill_path(name).is_file():
+        create_skill(name, description, body)
+    skill = read_skill(name)
+    if skill is None:
+        raise RuntimeError(f"skill 落盘失败：{name}")
+    return await upsert(
+        db,
+        Skill,
+        name=name,
+        defaults={"description": skill.description, "is_enabled": True},
+    )
 
 
 if __name__ == "__main__":

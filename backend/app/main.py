@@ -58,10 +58,33 @@ async def sweep_interrupted_turns() -> int:
     return int(calls or 0) + int(runs or 0)
 
 
+async def sync_skill_index() -> dict[str, int]:
+    """启动对账：把 `backend/skill` 目录与 `skills` 表对齐（SD17）。
+
+    文件是唯一真源，表是索引。目录里有、表里没有的（比如蒸馏线路刚生成的）
+    在这里补进来；description 漂移的跟着文件更新。
+
+    对账失败绝不能挡住启动 —— 和 `sweep_interrupted_turns` 同一个态度。
+    """
+    from app.db.session import SessionLocal
+    from app.skill.sync import reconcile
+
+    try:
+        async with SessionLocal() as db:
+            stats = await reconcile(db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Skill 索引对账失败（忽略）：%s", exc)
+        return {}
+    if stats.get("inserted") or stats.get("updated") or stats.get("invalid"):
+        logger.info("Skill 索引对账：%s", stats)
+    return stats
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     setup_logging(settings.log_level)
     await sweep_interrupted_turns()
+    await sync_skill_index()
     logger.info(
         "启动完成：env=%s mysql=%s milvus=%s langfuse=%s",
         settings.app_env,

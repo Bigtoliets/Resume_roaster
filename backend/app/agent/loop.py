@@ -91,6 +91,7 @@ from app.core.security import decrypt
 from app.db.models import Agent, Message, ModelConfig, Prompt, RunNote, Skill, Tool, ToolCall
 from app.llm.client import LLMClient, ToolCallRequest
 from app.obs.langfuse import observation as trace_span
+from app.skill.store import read_skill_body
 from app.tools.registry import build_tool_schema, execute_tool, get_impl, impl_status
 
 logger = logging.getLogger(__name__)
@@ -620,14 +621,18 @@ async def build_system_prompt(
     if agent.persona:
         base = f"{base}\n\n【人设覆盖】\n{agent.persona}"
 
-    # ④ Skills：每个 Skill 是一段 markdown 指令（如"看到 Redis 必须追问四个场景"），
-    #    拼接成独立小节。只取启用且写了内容的，顺序按 agent.skill_ids 的勾选顺序。
-    skill_rows = [await db.get(Skill, sid) for sid in (agent.skill_ids or [])]
-    skills = [row for row in skill_rows if row is not None and row.is_enabled and row.instructions]
-    if skills:
-        base += "\n\n" + "\n\n".join(
-            f"【Skill：{row.name}】\n{row.instructions}" for row in skills
-        )
+    # ④ Skills（SD15）：**表只给名字，正文在文件里**（backend/skill/<name>/SKILL.md）。
+    #    顺序按 agent.skill_ids 的勾选顺序；读不到就跳过并告警 ——
+    #    文件被删或改名时，不能让整条对话挂掉。
+    for skill_id in agent.skill_ids or []:
+        row = await db.get(Skill, skill_id)
+        if row is None or not row.is_enabled or row.deleted_at is not None:
+            continue
+        body = read_skill_body(row.name)
+        if not body:
+            logger.warning("Skill「%s」的正文读不到（backend/skill/%s/），已跳过", row.name, row.name)
+            continue
+        base += f"\n\n【Skill：{row.name}】\n{body}"
     return base
 
 

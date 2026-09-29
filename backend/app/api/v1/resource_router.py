@@ -46,6 +46,8 @@ from app.services.refs import (
     snapshot_agent,
     unbind_references,
 )
+from app.skill.store import SkillFormatError, create_skill
+from app.skill.sync import is_orphan
 from app.tools.registry import get_impl, impl_status
 
 
@@ -98,6 +100,11 @@ def _to_out(spec: ResourceSpec, obj: Any) -> BaseModel:
             out.impl_title = impl.title
             out.impl_kind = impl.kind
             out.needs_prompt = impl.needs_prompt
+        return out
+    if spec.slug == "skills":
+        # 孤儿动态判定：表里有行、磁盘上没有目录（SD22）
+        out = SkillOut.model_validate(obj)
+        out.is_orphan = is_orphan(obj.name)
         return out
     return spec.schema_out.model_validate(obj)
 
@@ -157,6 +164,13 @@ def build_resource_router(spec: ResourceSpec) -> APIRouter:
         ).scalar_one_or_none()
         if existing is not None:
             raise HTTPException(status_code=409, detail=f"{spec.label} 名称已存在：{payload.name}")
+        if spec.slug == "skills":
+            # SD22：新建 = 真的在 backend/skill/<name>/ 落一份 SKILL.md。
+            # 目录已存在（或名字不合规范）都拒绝——文件是唯一真源，不能只写库。
+            try:
+                create_skill(payload.name, payload.description)
+            except SkillFormatError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         obj = _apply_payload(spec, spec.model(), payload)
         db.add(obj)
         await db.commit()
@@ -192,6 +206,16 @@ def build_resource_router(spec: ResourceSpec) -> APIRouter:
         item_id: int, payload: Any = Body(...), db: AsyncSession = Depends(get_db)
     ) -> Any:
         obj = await _get_or_404(db, spec, item_id)
+        if spec.slug == "skills":
+            # SD22：不可编辑。正文在文件里，表只是索引——页面改的值会被启动对账覆盖，
+            # 与其静默回滚，不如直接拒绝，让人去改文件。
+            raise HTTPException(
+                status_code=405,
+                detail=(
+                    "Skill 不可从页面编辑：正文在 backend/skill/"
+                    f"{obj.name}/SKILL.md 里，请直接改文件"
+                ),
+            )
         _apply_payload(spec, obj, payload)
         await db.commit()
         await db.refresh(obj)
@@ -224,6 +248,16 @@ def build_resource_router(spec: ResourceSpec) -> APIRouter:
         from app.db.base import utcnow
 
         obj = await _get_or_404(db, spec, item_id)
+        if spec.slug == "skills" and not is_orphan(obj.name):
+            # SD22：页面只允许删"孤儿行"（磁盘上已经没有的）。删目录不可逆，
+            # 而那个目录里可能正躺着蒸馏线路积累的经验。
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"磁盘上还存在 backend/skill/{obj.name}/，不能从页面删除。"
+                    "要清理请手动删目录（删完这里会变成孤儿行，那时可以删）。"
+                ),
+            )
         unbound: list[dict[str, Any]] = []
         if spec.slug != "agents":
             refs = await find_referencing_agents(db, spec.slug, item_id)

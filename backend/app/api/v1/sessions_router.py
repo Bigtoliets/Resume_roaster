@@ -523,6 +523,14 @@ async def _turn_stream(
                 logger.exception("ReAct 回合失败")
                 await _mark_failed(db, run_id, f"{type(exc).__name__}: {exc}")
                 await emit("error", {"code": "INTERNAL", "msg": str(exc), "retryable": True})
+            finally:
+                # Skill 蒸馏线路（SD6 / SD18）：**成功失败都触发**，因为"坑"不只在失败里。
+                # 必须另起独立任务：本函数的 finally 会 cancel 掉未完成的 task，
+                # 而蒸馏要跑 30~60 秒（等 Langfuse 最终一致 + 两轮模型调用）。
+                with contextlib.suppress(Exception):
+                    from app.skill.distill import schedule
+
+                    schedule(run_id)
 
     task = asyncio.create_task(worker())
     try:

@@ -145,9 +145,14 @@ class KnowledgeBaseOut(ORMBase):
 
 
 class SkillIn(BaseModel):
+    """新建 skill（SD22：页面只允许新建，不允许编辑）。
+
+    `instructions` 已删除 —— 正文在 `backend/skill/<name>/SKILL.md` 里，
+    页面只显示 name + description。
+    """
+
     name: str
     description: str = ""
-    instructions: str = ""
     is_enabled: bool = True
 
 
@@ -155,8 +160,9 @@ class SkillOut(ORMBase):
     id: int
     name: str
     description: str
-    instructions: str
     is_enabled: bool
+    #: 磁盘上找不到对应目录时为 True（表里有行、文件没了）。动态判定，不落库。
+    is_orphan: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -174,6 +180,8 @@ class AgentIn(BaseModel):
     #: 上下文用量超过 context_window 的这个百分比就换页
     context_threshold_pct: int = 80
     parallel_tools: bool = True
+    #: 回合结束后是否自动跑 skill 蒸馏线路
+    auto_distill: bool = False
     params_override: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
 
@@ -191,6 +199,7 @@ class AgentOut(ORMBase):
     max_rounds: int
     context_threshold_pct: int
     parallel_tools: bool
+    auto_distill: bool
     params_override: dict[str, Any]
     is_enabled: bool
     created_at: datetime

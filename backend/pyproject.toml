@@ -23,6 +23,8 @@ dependencies = [
     "langchain-core>=0.3",
     "cachetools>=5.3",
     "python-multipart>=0.0.9",
+    # skill 的 frontmatter 用真正的 YAML 解析器读（手写切分会被 description 里的冒号/引号搞崩）
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +52,7 @@ ignore = ["B008"]
 # （原来这里指向 app/scenes/resume_diagnosis/*，那两个目录在 D31 之后已经删掉了 ——
 #   投影提示词现在住在 app/agent/notes.py。）
 "app/agent/notes.py" = ["E501"]
+"app/skill/distill_prompts.py" = ["E501"]
 "scripts/seed_demo.py" = ["E501"]
 
 [tool.pytest.ini_options]
