@@ -179,6 +179,11 @@ def hybrid_search(
     这个来源标注对调检索质量很关键（`retrieval` 字段）。
 
     参数都可从知识库配置里传：`rrf_k`（RRF 平滑常数）、`recall_multiplier`（每路召回倍数）。
+
+    返回每条命中带两个分数：
+    - `score`：RRF 融合分，只反映**名次**，量级 0.0x，不能当相关度阈值；
+    - `similarity`：dense 路的**原始相似度**（IP，向量已归一化 ≈ 余弦）；
+      只被 BM25 命中的条目为 `None`。
     """
     client = get_client()
     expr = f'id like "{id_prefix}%"' if id_prefix else ""
@@ -217,6 +222,7 @@ def hybrid_search(
                 {
                     "id": doc_id,
                     "score": 0.0,
+                    "similarity": None,
                     "text": (hit.get("entity") or {}).get(TEXT_FIELD, ""),
                     "source": collection,
                     "retrieval": [],
@@ -225,6 +231,8 @@ def hybrid_search(
             )
             # RRF：每条贡献 1/(k+rank)，两路都命中就自然叠加
             entry["score"] += 1.0 / (rrf_k + rank)
+            if label == "dense":
+                entry["similarity"] = float(hit.get("distance") or 0.0)
             entry["retrieval"].append(label)
             entry["_rank"][label] = rank
 

@@ -10,7 +10,13 @@
     rrf_k               RRF 平滑常数，越大越平缓（默认 60）
     recall_multiplier   每路预先召回 top_k 的多少倍（默认 3）
     snippet_chars       返回给模型的正文截断长度（默认 1200）
-    min_score           RRF 分数下限，低于它的结果不返回（默认 0 = 不过滤）
+    min_score           **dense 原始相似度**下限（默认 0 = 不过滤）。注意不是 RRF 分：
+                        RRF 只反映名次、量级 0.0x，当阈值不可解释。纯 BM25 命中的条目
+                        没有相似度，不参与这条过滤。
+
+返回的每条结果带 `similarity`（dense 原始相似度，纯关键词命中为 null）、
+`parent` 与 `chunks_hit`：语料按小标题切成块后，同一个岗位可能命中多块，
+这里**只保留命中最高的那一块**，`chunks_hit` 告诉你它总共被命中了几块。
 """
 
 from __future__ import annotations
@@ -92,6 +98,7 @@ async def search_knowledge_bases(
                         "collection": kb.collection,
                         "id": hit["id"],
                         "_score": 0.0,
+                        "_similarity": None,
                         "_labels": set(),
                         "matched_queries": [],
                         "_text": str(hit.get("text") or ""),
@@ -100,6 +107,11 @@ async def search_knowledge_bases(
                     },
                 )
                 entry["_score"] += float(hit["score"])
+                similarity = hit.get("similarity")
+                if similarity is not None:
+                    value = float(similarity)
+                    current = entry["_similarity"]
+                    entry["_similarity"] = value if current is None else max(current, value)
                 entry["_labels"].add(str(hit.get("retrieval") or "dense"))
                 if query not in entry["matched_queries"]:
                     entry["matched_queries"].append(query)
@@ -112,16 +124,41 @@ async def search_knowledge_bases(
             }
         )
 
-    items: list[dict[str, Any]] = []
+    # 分块之后同一个岗位会占多个坑位：只留命中最高的那一块，记下总共命中几块。
+    # 不做这一步，top-k 会被同一个岗位的不同段落刷屏，其它岗位一个都进不来。
+    by_parent: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in merged.values():
-        if entry["_score"] < entry["_min_score"]:
+        parent = str(entry["id"]).split("#", 1)[0]
+        key = (str(entry["collection"]), parent)
+        previous = by_parent.get(key)
+        if previous is None:
+            entry["_parent"] = parent
+            entry["_chunks"] = 1
+            by_parent[key] = entry
+            continue
+        previous["_chunks"] += 1
+        if entry["_score"] > previous["_score"]:
+            entry["_parent"] = parent
+            entry["_chunks"] = previous["_chunks"]
+            by_parent[key] = entry
+
+    items: list[dict[str, Any]] = []
+    for entry in by_parent.values():
+        # min_score 的语义是 **dense 原始相似度**下限：RRF 分只反映名次（量级 0.0x），
+        # 拿它当相关度阈值不可解释。纯 BM25 命中的条目没有相似度，不参与这条过滤，
+        # 否则"关键词精确命中"会被静默丢掉。
+        similarity = entry["_similarity"]
+        if similarity is not None and similarity < entry["_min_score"]:
             continue
         items.append(
             {
                 "knowledge_base": entry["knowledge_base"],
                 "collection": entry["collection"],
                 "id": entry["id"],
+                "parent": entry["_parent"],
+                "chunks_hit": entry["_chunks"],
                 "score": round(entry["_score"], 4),
+                "similarity": round(float(similarity), 4) if similarity is not None else None,
                 "retrieval": _merge_retrieval(entry["_labels"]),
                 "matched_queries": entry["matched_queries"],
                 "text": entry["_text"][: entry["_snippet_chars"]],

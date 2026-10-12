@@ -60,10 +60,30 @@ def fake_retrieval(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> list[dict]:
         if query == "角度一":
             return [
-                {"id": "doc1", "score": 2 / (rrf_k + 1), "text": "doc1 正文", "retrieval": "both"},
-                {"id": "doc2", "score": 1 / (rrf_k + 2), "text": "doc2 正文", "retrieval": "bm25"},
+                {
+                    "id": "doc1",
+                    "score": 2 / (rrf_k + 1),
+                    "similarity": 0.91,
+                    "text": "doc1 正文",
+                    "retrieval": "both",
+                },
+                {
+                    "id": "doc2",
+                    "score": 1 / (rrf_k + 2),
+                    "similarity": None,
+                    "text": "doc2 正文",
+                    "retrieval": "bm25",
+                },
             ]
-        return [{"id": "doc1", "score": 1 / (rrf_k + 1), "text": "doc1 正文", "retrieval": "dense"}]
+        return [
+            {
+                "id": "doc1",
+                "score": 1 / (rrf_k + 1),
+                "similarity": 0.88,
+                "text": "doc1 正文",
+                "retrieval": "dense",
+            }
+        ]
 
     monkeypatch.setattr("app.vector.milvus_client.hybrid_search", fake_hybrid)
     monkeypatch.setattr("app.vector.embedding.get_embedding_service", lambda: FakeEmbedding())
@@ -88,12 +108,49 @@ async def test_multi_query_accumulates_and_marks_sources(fake_retrieval: None) -
     assert len(doc2["matched_queries"]) == 1
 
 
-async def test_min_score_filters_weak_hits(fake_retrieval: None) -> None:
-    db = FakeDB([make_kb(min_score=0.02)])
+async def test_min_score_filters_on_similarity_not_rrf(fake_retrieval: None) -> None:
+    """min_score 的语义是 **dense 原始相似度**下限，不是 RRF 分（RRF 只反映名次）。
+
+    doc1 相似度 0.91 < 0.95 被滤掉；doc2 是纯 BM25 命中、没有相似度，
+    不参与这条过滤——否则"关键词精确命中"会被静默丢掉。
+    """
+    db = FakeDB([make_kb(min_score=0.95)])
     result = await search_knowledge_bases(
         db, queries=["角度一"], knowledge_base_ids=[1]  # type: ignore[arg-type]
     )
-    assert [item["id"] for item in result["items"]] == ["doc1"]
+    assert [item["id"] for item in result["items"]] == ["doc2"]
+    assert result["items"][0]["similarity"] is None
+
+
+async def test_similarity_is_reported(fake_retrieval: None) -> None:
+    db = FakeDB([make_kb()])
+    result = await search_knowledge_bases(
+        db, queries=["角度一"], knowledge_base_ids=[1]  # type: ignore[arg-type]
+    )
+    assert result["items"][0]["similarity"] == pytest.approx(0.91)
+
+
+async def test_chunks_of_one_document_collapse_to_the_best(monkeypatch: pytest.MonkeyPatch) -> None:
+    """分块后同一岗位会占多个坑位：只留命中最高的那块，并报告总共命中几块。"""
+
+    def fake_hybrid(_collection: str, *, query: str, **_kwargs: object) -> list[dict]:
+        return [
+            {"id": "jd_001#1", "score": 0.03, "similarity": 0.80, "text": "职责段", "retrieval": "dense"},
+            {"id": "jd_001#2", "score": 0.05, "similarity": 0.93, "text": "要求段", "retrieval": "both"},
+            {"id": "jd_002", "score": 0.04, "similarity": 0.88, "text": "别的岗位", "retrieval": "dense"},
+        ]
+
+    monkeypatch.setattr("app.vector.milvus_client.hybrid_search", fake_hybrid)
+    monkeypatch.setattr("app.vector.embedding.get_embedding_service", lambda: FakeEmbedding())
+
+    db = FakeDB([make_kb()])
+    result = await search_knowledge_bases(
+        db, queries=["角度一"], knowledge_base_ids=[1]  # type: ignore[arg-type]
+    )
+    assert [item["id"] for item in result["items"]] == ["jd_001#2", "jd_002"]
+    assert result["items"][0]["parent"] == "jd_001"
+    assert result["items"][0]["chunks_hit"] == 2
+    assert result["items"][1]["chunks_hit"] == 1
 
 
 async def test_snippet_chars_limits_text(fake_retrieval: None) -> None:

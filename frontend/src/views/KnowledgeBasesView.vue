@@ -188,9 +188,9 @@ onMounted(async () => {
           </FormRow>
           <FormRow
             label="分数下限 min_score"
-            hint="默认 0（不过滤）。RRF 分数里「两路都命中第 1」约 0.033，填 0.03 能滤掉单路弱命中"
+            hint="默认 0（不过滤）。这是**语义相似度**下限（0~1），实测命中多在 0.35~0.7，填 0.5 只留语义相近的。纯关键词命中没有相似度，不受它影响"
           >
-            <input type="number" step="0.001" v-model.number="draft.min_score" min="0" />
+            <input type="number" step="0.01" v-model.number="draft.min_score" min="0" max="1" />
           </FormRow>
         </div>
       </div>

@@ -126,6 +126,11 @@ function agentNameOf(message: MessageRow): string {
   return String((message.content as { agent_name?: string })?.agent_name || '')
 }
 
+/** 追问轮（后端 `content.kind === 'ask'`）换一种气泡，别混在正常回答里。 */
+function kindOf(message: MessageRow): string {
+  return String((message.content as { kind?: string })?.kind || '')
+}
+
 async function scrollToBottom(smooth = false) {
   await nextTick()
   scrollAnchor.value?.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'end' })
@@ -605,6 +610,18 @@ onMounted(async () => {
 
           <div v-else-if="message.role === 'user'" class="bubble-row bubble-row--user">
             <div class="bubble bubble--user">{{ textOf(message) }}</div>
+          </div>
+
+          <div v-else-if="kindOf(message) === 'ask'" class="bubble-row">
+            <div class="avatar">问</div>
+            <div style="min-width: 0; flex: 1">
+              <div class="row" style="gap: 8px; margin-bottom: 6px">
+                <span class="eyebrow">{{ agentNameOf(message) || '助手' }} · 需要你补充</span>
+              </div>
+              <div class="bubble bubble--ai bubble--ask">
+                <MarkdownBlock :text="textOf(message)" :cache-key="message.id" />
+              </div>
+            </div>
           </div>
 
           <div v-else class="bubble-row">

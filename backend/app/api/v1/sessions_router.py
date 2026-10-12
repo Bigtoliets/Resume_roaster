@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.checkpoints import get as get_checkpoint
 from app.agent.checkpoints import resolve_pending
 from app.agent.checkpoints import snapshot as checkpoint_snapshot
-from app.agent.loop import run_react_turn
+from app.agent.loop import EmitFn, run_react_turn
 from app.api.deps import get_db
 from app.core.cache import (
     cache_stats,
@@ -50,6 +50,9 @@ from app.db.models import (
     ToolCall,
 )
 from app.db.session import SessionLocal
+from app.intent.config import INTENT_TIMEOUT_S, SLOT_TARGET_ROLE, TARGET_ROLE_ASK
+from app.intent.pipeline import TurnIntent
+from app.intent.pipeline import resolve as resolve_intent
 from app.obs.langfuse import current_trace_id, observation, propagated, trace_url
 from app.obs.langfuse import flush as flush_langfuse
 from app.schemas.resource import ApprovalIn, ToolCallOut
@@ -383,6 +386,8 @@ async def _turn_stream(
 
     async def worker() -> None:
         async with SessionLocal() as db:
+            # 追问轮不跑主循环，也就没有可蒸馏的东西（Q10）
+            distill = True
             try:
                 agent = await db.get(Agent, agent_id)
                 session = await db.get(Session, session_id)
@@ -421,6 +426,37 @@ async def _turn_stream(
                     if attachment is not None
                     else []
                 )
+
+                # ── 意图层：主循环之前的页面参数归一化（Q1）─────────────────
+                # 只把用户输入归一化成槽位、并决定要不要追问，不改变"谁来回话"。
+                # 任何失败都降级成空槽位，照常进主循环（Q5）——所以这里绝不抛异常。
+                inherited_role = await _inherited_role(db, session_id)
+                pending_slot = await _pending_slot(db, session_id)
+                intent = await _resolve_intent(
+                    session_id=session_id,
+                    text=text,
+                    inherited_role=inherited_role,
+                    pending_slot=pending_slot,
+                )
+                # 继承优先于追问（Q8）；本轮抽到的值覆盖继承值
+                target_role = (intent.target_role or inherited_role)[:128]
+                if target_role:
+                    await _remember_target_role(db, run_id, target_role)
+
+                if intent.ask:
+                    await _ask_for_slot(
+                        db,
+                        session_id=session_id,
+                        run_id=run_id,
+                        session=session,
+                        agent=agent,
+                        user_text=text,
+                        slot=intent.slot or SLOT_TARGET_ROLE,
+                        emit=emit,
+                        started=started,
+                    )
+                    distill = False
+                    return
 
                 await emit(
                     "stage",
@@ -462,7 +498,7 @@ async def _turn_stream(
                             session_id=session_id,
                             run_id=run_id,
                             agent=agent,
-                            user_content=text,
+                            user_content=_compose_turn_text(text, target_role),
                             attachments=attachments,
                             emit=emit,
                             user_message_id=user_message_id,
@@ -524,13 +560,14 @@ async def _turn_stream(
                 await _mark_failed(db, run_id, f"{type(exc).__name__}: {exc}")
                 await emit("error", {"code": "INTERNAL", "msg": str(exc), "retryable": True})
             finally:
-                # Skill 蒸馏线路（SD6 / SD18）：**成功失败都触发**，因为"坑"不只在失败里。
-                # 必须另起独立任务：本函数的 finally 会 cancel 掉未完成的 task，
-                # 而蒸馏要跑 30~60 秒（等 Langfuse 最终一致 + 两轮模型调用）。
-                with contextlib.suppress(Exception):
-                    from app.skill.distill import schedule
+                if distill:
+                    # Skill 蒸馏线路（SD6 / SD18）：**成功失败都触发**，因为"坑"不只在失败里。
+                    # 必须另起独立任务：本函数的 finally 会 cancel 掉未完成的 task，
+                    # 而蒸馏要跑 30~60 秒（等 Langfuse 最终一致 + 两轮模型调用）。
+                    with contextlib.suppress(Exception):
+                        from app.skill.distill import schedule
 
-                    schedule(run_id)
+                        schedule(run_id)
 
     task = asyncio.create_task(worker())
     try:
@@ -611,3 +648,154 @@ async def _mark_failed(db: AsyncSession, run_id: int, message: str) -> None:
         run_row.status = "failed"
         run_row.error = message[:2000]
         await db.commit()
+
+
+# ---------------------------------------------------------------- 意图层
+
+
+def _compose_turn_text(text: str, target_role: str) -> str:
+    """把归一化出来的槽位拼在用户消息头部（Q2）。
+
+    只在真的取到岗位时才注入——字段为空时不写空壳，免得给模型制造噪声。
+    """
+    body = (text or "").strip()
+    if not target_role:
+        return body
+    head = f"【本轮输入】\n目标岗位：{target_role}"
+    return f"{head}\n\n{body}" if body else head
+
+
+async def _pending_slot(db: AsyncSession, session_id: int) -> str:
+    """上一条助手消息如果是追问，返回它要的槽位名（Q16）。
+
+    只看最后一条 assistant 消息：追问之后用户已经回了话，只要那条追问仍然是
+    最近的一条助手消息，就说明用户正在回答它。
+    """
+    stmt = (
+        select(Message)
+        .where(Message.session_id == session_id, Message.role == "assistant")
+        .order_by(Message.id.desc())
+        .limit(1)
+    )
+    row = (await db.execute(stmt)).scalars().first()
+    if row is None or not isinstance(row.content, dict):
+        return ""
+    if row.content.get("kind") != "ask":
+        return ""
+    return str(row.content.get("slot") or "")
+
+
+async def _inherited_role(db: AsyncSession, session_id: int) -> str:
+    """本会话最近一次非空的目标岗位（Q8：继承优先于追问）。"""
+    stmt = (
+        select(Run.target_role)
+        .where(Run.session_id == session_id, Run.target_role != "")
+        .order_by(Run.id.desc())
+        .limit(1)
+    )
+    return str((await db.execute(stmt)).scalars().first() or "")
+
+
+async def _remember_target_role(db: AsyncSession, run_id: int, target_role: str) -> None:
+    """把岗位写到本轮的 Run 上（Q17）。继承来的值也回填，报告 meta 才不会时有时无。"""
+    run_row = await db.get(Run, run_id)
+    if run_row is None or run_row.target_role == target_role:
+        return
+    run_row.target_role = target_role
+    await db.commit()
+
+
+async def _resolve_intent(
+    *, session_id: int, text: str, inherited_role: str, pending_slot: str
+) -> TurnIntent:
+    """意图层唯一的调用点：硬超时 + 绝不抛异常（Q5）。
+
+    判定结果不落库（Q13），所以顺手写进 Langfuse 的 span——出问题时至少有得看。
+    用 `propagated` 挂上 session，这条 span 才和本轮 ReAct 归到同一个会话视图里。
+    """
+    try:
+        with propagated(session_id=f"session_{session_id}"):
+            with observation(
+                "intent",
+                input={"text": text, "pending_slot": pending_slot, "inherited_role": inherited_role},
+            ) as span:
+                result = await asyncio.wait_for(
+                    resolve_intent(
+                        text=text, inherited_role=inherited_role, pending_slot=pending_slot
+                    ),
+                    timeout=INTENT_TIMEOUT_S,
+                )
+                if span is not None:
+                    with contextlib.suppress(Exception):
+                        span.update(
+                            output={
+                                "intent": result.intent,
+                                "target_role": result.target_role,
+                                "ask": result.ask,
+                            },
+                            metadata={"source": result.source, "confidence": result.confidence},
+                        )
+                return result
+    except Exception as exc:  # noqa: BLE001 - 降级放行，绝不阻塞主循环
+        logger.warning("意图层降级（%s）：%s", type(exc).__name__, exc)
+        return TurnIntent()
+
+
+async def _ask_for_slot(
+    db: AsyncSession,
+    *,
+    session_id: int,
+    run_id: int,
+    session: Session,
+    agent: Agent,
+    user_text: str,
+    slot: str,
+    emit: EmitFn,
+    started: float,
+) -> None:
+    """追问一轮：照常落一条 assistant 消息，只是没跑主循环（Q10）。
+
+    没有新增 SSE 事件类型：复用 `assistant` + `done`，多带一个 `kind` 标记，
+    前端据此换成追问气泡。
+    """
+    elapsed = int((time.perf_counter() - started) * 1000)
+    assistant = Message(
+        session_id=session_id,
+        role="assistant",
+        type="text",
+        content={
+            "text": TARGET_ROLE_ASK,
+            "steps": [],
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "kind": "ask",
+            "slot": slot,
+        },
+        run_id=run_id,
+        latency_ms=elapsed,
+    )
+    db.add(assistant)
+    run_row = await db.get(Run, run_id)
+    if run_row is not None:
+        run_row.status = "succeeded"
+        run_row.elapsed_ms = elapsed
+    if not session.title or session.title.startswith("新会话"):
+        session.title = make_title(user_text or "新会话", agent.name)
+    await db.commit()
+    await db.refresh(assistant)
+    invalidate_session(session_id)
+    await emit(
+        "assistant",
+        {
+            "message_id": assistant.id,
+            "content": TARGET_ROLE_ASK,
+            "steps": [],
+            "kind": "ask",
+            "slot": slot,
+            "agent_id": agent.id,
+            "agent_name": agent.name,
+            "rounds": 0,
+            "elapsed_ms": elapsed,
+        },
+    )
+    await emit("done", {"run_id": run_id, "elapsed_ms": elapsed})

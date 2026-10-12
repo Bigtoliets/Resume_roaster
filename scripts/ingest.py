@@ -8,12 +8,15 @@
 - JSONL 只强制 doc_id / job_family / raw_text 三个字段；
 - 可选元数据（company / title / city / publish_date / source_url / stage）会被拼成一行抬头写进
   正文，报告里依然能展示"引自某大厂 2026-08 的 JD"；
-- id = {岗位族前缀}_{doc_id}，超长文本才拆行并加 #N 后缀；
+- id = {岗位族前缀}_{doc_id}；一条文档按小标题切成若干块，多块时加 #N 后缀；
 - 幂等：先按 id 删除旧行再写入。
 
 Milvus 侧 schema 是 id / content / dense / sparse：
 写入时源文件的 `raw_text` 映射到 `content`，**sparse 不写** —— 它由 collection 上的
 BM25 Function 从 content 自动生成（见 app/vector/milvus_client.py 的注释）。
+
+入库前先过一遍 `app/vector/chunking.py`：去掉拼接留下的重复段，并按
+「岗位职责 / 任职要求」这类小标题切块——职责和要求压进同一个向量会互相稀释。
 """
 
 from __future__ import annotations
@@ -42,9 +45,6 @@ HEADER_FIELDS: list[tuple[str, str]] = [
     ("publish_date", "发布"),
     ("source_url", "来源"),
 ]
-
-MAX_CHARS = 6000  # BGE-M3 可吃 8192 token；这里按字符保守切分，超出才拆行
-
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
@@ -76,35 +76,23 @@ def build_header(item: dict[str, Any]) -> str:
     return "【" + "｜".join(parts) + "】" if parts else ""
 
 
-def split_long_text(text: str) -> list[str]:
-    """超长文本按段落拼接切分，尽量不切断段落。"""
-    if len(text) <= MAX_CHARS:
-        return [text]
-    paragraphs = [p for p in text.split("\n") if p.strip()]
-    chunks: list[str] = []
-    buffer = ""
-    for paragraph in paragraphs:
-        if len(buffer) + len(paragraph) + 1 > MAX_CHARS and buffer:
-            chunks.append(buffer.strip())
-            buffer = ""
-        buffer += paragraph + "\n"
-    if buffer.strip():
-        chunks.append(buffer.strip())
-    return chunks or [text[:MAX_CHARS]]
-
-
 def to_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """JSONL 记录 → 待向量化的行（一行为一篇文档，超长才拆）。"""
+    """JSONL 记录 → 待向量化的行：按小标题切块，每块都带抬头。
+
+    抬头（公司/岗位/城市/发布…）复制到每一块上，不计入切块长度——缺了它，
+    模型只看到"熟悉 Flink"却不知道是哪家公司哪个岗位在要。
+    """
+    from app.vector.chunking import chunk_document
+
     rows: list[dict[str, Any]] = []
     for item in records:
         job_family = normalize(str(item["job_family"]))
         base_id = build_id(job_family, str(item["doc_id"]).strip())
         header = build_header(item)
-        parts = split_long_text(str(item["raw_text"]).strip())
-        for index, part in enumerate(parts, start=1):
-            text = f"{header}\n{part}" if header else part
-            row_id = base_id if index == 1 else f"{base_id}#{index}"
-            rows.append({"id": row_id, "content": text, "job_family": job_family})
+        chunks = chunk_document(str(item["raw_text"]).strip(), header=header)
+        for index, chunk in enumerate(chunks, start=1):
+            row_id = base_id if len(chunks) == 1 else f"{base_id}#{index}"
+            rows.append({"id": row_id, "content": chunk, "job_family": job_family})
     return rows
 
 

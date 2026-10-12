@@ -19,8 +19,6 @@ dependencies = [
     "cryptography>=42.0",
     "jinja2>=3.1",
     "pymupdf>=1.24",
-    "langgraph>=0.2.20",
-    "langchain-core>=0.3",
     "cachetools>=5.3",
     "python-multipart>=0.0.9",
     # skill 的 frontmatter 用真正的 YAML 解析器读（手写切分会被 description 里的冒号/引号搞崩）

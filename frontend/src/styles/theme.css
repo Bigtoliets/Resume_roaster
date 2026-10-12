@@ -870,6 +870,12 @@ tr.is-active {
   box-shadow: 0 1px 2px rgba(26, 24, 21, 0.04);
 }
 
+/* 追问：主循环之前的槽位补齐，用朱红左边框和正常回答区分开 */
+.bubble--ask {
+  border-left: 3px solid var(--seal);
+  background: #fffdf7;
+}
+
 .bubble--user {
   border-bottom-right-radius: 5px;
   background: var(--ink);

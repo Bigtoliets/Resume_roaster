@@ -43,7 +43,11 @@ async def run(query: str, collections: list[str], top_k: int, prefix: str | None
             overall_ok = False
         for hit in hits:
             preview = hit["text"].replace("\n", " ")[:70]
-            print(f"  {hit['score']:.4f}  {hit['id']:<22} {preview}…")
+            # rrf 分只反映名次（量级 0.0x）；sim 才是 dense 路的真实相似度，
+            # 调相关度阈值看的是后者（纯关键词命中没有 sim）。
+            similarity = hit.get("similarity")
+            shown = f"{similarity:.3f}" if isinstance(similarity, float) else "  -  "
+            print(f"  rrf={hit['score']:.4f}  sim={shown}  {hit['id']:<22} {preview}…")
     return 0 if overall_ok else 1
 
 
